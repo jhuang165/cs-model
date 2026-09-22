@@ -4,3 +4,7 @@
 /data/*
 !/data/matchdata_sample*
 /tools
+/.venv/
+/.pandascore_token
+__pycache__/
+.DS_Store
