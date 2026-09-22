@@ -38,20 +38,28 @@ ELO_PER_LOGIT = 400.0 / math.log(10)
 class BatchBT(Model):
     def __init__(self, tau_days: float = 180.0, refit_days: float = 1.0, C: float = 3.0,
                  region: bool = True, region_C: float | None = None, intercept: bool = False,
-                 min_weight: float = 0.02, warm: bool = True):
+                 min_weight: float = 0.02, warm: bool = True, round_weight: float = 0.0,
+                 round_scale: float = 0.25):
+        # round_weight > 0 adds a margin likelihood: each round of a valid map is a Bernoulli with
+        # logit round_scale * (theta_1 - theta_2), weighted by round_weight because rounds within a
+        # map are correlated (economy, momentum) and carry less than one independent observation each.
+        self.round_weight, self.round_scale = round_weight, round_scale
         self.tau, self.refit, self.C, self.region = tau_days * DAY, refit_days * DAY, C, region
         self.region_C = region_C or C   # region columns see thousands of maps, so the ridge barely binds anyway
         self.intercept, self.min_weight, self.warm = intercept, min_weight, warm
         self.idx: dict[str, int] = {}          # entity -> column
         self.ridx: dict[str, int] = {}         # region -> column (after entities)
         self.entity_region: dict[str, str] = {}
-        self.obs: list[tuple[float, tuple[int, ...], tuple[int, ...], float]] = []  # (time, cols1, cols2, y)
+        # (time, cols1, cols2, y, weight multiplier, design scale); round rows use scale round_scale
+        self.obs: list[tuple[float, tuple[int, ...], tuple[int, ...], float, float, float]] = []
         self.last_fit = -math.inf
         self.theta = np.zeros(0)
         self.b = 0.0
         self.fits = 0
         self.fit_seconds = 0.0
         tag = f"tau={tau_days:g}d,refit={refit_days:g}d,C={C:g}" + (",region" if region else "") + (",b" if intercept else "")
+        if round_weight:
+            tag += f",rounds={round_weight:g}x{round_scale:g}"
         self.name = f"batch-bt[{tag}]"
 
     # ---- bookkeeping -------------------------------------------------------------------------
@@ -82,18 +90,18 @@ class BatchBT(Model):
         if len(keep) < 50 or n_cols == 0 or len({o[3] for o in keep}) < 2:
             return
         rows, cols, vals, y, w = [], [], [], [], []
-        for i, (t, c1, c2, out) in enumerate(keep):
+        for i, (t, c1, c2, out, wm, sc) in enumerate(keep):
             for c in c1:
-                rows.append(i); cols.append(c); vals.append(1.0 / len(c1))
+                rows.append(i); cols.append(c); vals.append(sc / len(c1))
             for c in c2:
-                rows.append(i); cols.append(c); vals.append(-1.0 / len(c2))
+                rows.append(i); cols.append(c); vals.append(-sc / len(c2))
             if self.region:
                 r1 = self._rcol(self.entity_region[self._ent(c1[0])])
                 r2 = self._rcol(self.entity_region[self._ent(c2[0])])
                 if r1 != r2:
-                    rows += [i, i]; cols += [n_ent + r1, n_ent + r2]; vals += [1.0, -1.0]
+                    rows += [i, i]; cols += [n_ent + r1, n_ent + r2]; vals += [sc, -sc]
             y.append(out)
-            w.append(math.exp(-(now - t) / self.tau))
+            w.append(wm * math.exp(-(now - t) / self.tau))
         n_cols = n_ent + (len(self.ridx) if self.region else 0)
         X = sp.csr_matrix((vals, (rows, cols)), shape=(len(keep), n_cols))
         y, w = np.array(y), np.array(w)
@@ -145,7 +153,10 @@ class BatchBT(Model):
         c1 = self._cols(m.team1_players, m.team1_countries)
         c2 = self._cols(m.team2_players, m.team2_countries)
         for mp in m.maps:
-            self.obs.append((m.time, c1, c2, 1.0 if mp.t1_won else 0.0))
+            self.obs.append((m.time, c1, c2, 1.0 if mp.t1_won else 0.0, 1.0, 1.0))
+            if self.round_weight and mp.valid_for_margin:
+                self.obs.append((m.time, c1, c2, 1.0, self.round_weight * mp.t1, self.round_scale))
+                self.obs.append((m.time, c1, c2, 0.0, self.round_weight * mp.t2, self.round_scale))
 
     def rating(self, players) -> float:
         """Elo-scale rating (1500 = region-neutral zero) for display."""

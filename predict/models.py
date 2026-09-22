@@ -213,14 +213,16 @@ class PlayerGlicko(Model):
         """Per-map win probability; the base model ignores the map name."""
         return self._p_map(m)
 
-    def _update_side(self, players, opp_r, opp_rd, score, off=0.0):
+    def _update_side(self, players, opp_r, opp_rd, score, off=0.0, scale=1.0, n=1.0):
+        """Glicko-1 update. scale/n turn it into n Bernoulli observations whose logit is `scale`
+        times the map logit (used for rounds); score is then the observed share."""
         gv = self.g(opp_rd)
         for p in players:
-            e = elo_expected(gv * (self.r[p] - opp_r) + off)
-            d2 = 1.0 / (Q * Q * gv * gv * e * (1 - e))
+            e = elo_expected(scale * (gv * (self.r[p] - opp_r) + off))
+            d2 = 1.0 / (n * Q * Q * scale * scale * gv * gv * e * (1 - e))
             rd2 = self.rd[p] ** 2
             new_rd2 = 1.0 / (1.0 / rd2 + 1.0 / d2)
-            self.r[p] += Q * new_rd2 * gv * (score - e)
+            self.r[p] += Q * new_rd2 * gv * scale * n * (score - e)
             self.rd[p] = max(self.min_rd, math.sqrt(new_rd2))
 
     def update(self, m):
@@ -359,14 +361,20 @@ class RegionalGlicko(PlayerGlicko):
     """
 
     def __init__(self, seed: bool = True, offset: bool = True, seed_rd: float = float("inf"),
-                 offset_lr: float = 2.0, start_rd: float = 150.0, c: float = 20.0, min_rd: float = 30.0, **kw):
+                 offset_lr: float = 2.0, start_rd: float = 150.0, c: float = 20.0, min_rd: float = 30.0,
+                 round_weight: float = 0.0, round_scale: float = 0.25, **kw):
         super().__init__(start_rd=start_rd, c=c, min_rd=min_rd, **kw)
+        # round_weight > 0: after each map's binary update, a second update treating the map's rounds
+        # as round_weight * rounds Bernoulli observations on a logit scale of round_scale (see BatchBT)
+        self.round_weight, self.round_scale = round_weight, round_scale
         self.seed, self.offset, self.seed_rd, self.offset_lr = seed, offset, seed_rd, offset_lr
         self.region_of = {}                       # player -> region
         self.members = defaultdict(set)           # region -> players
         self.o = defaultdict(float)               # region -> rating-point offset
         tag = "+".join(x for x, on in (("seed", seed), ("offset", offset)) if on) or "none"
         self.name = f"regional-glicko[{tag}](rd0={start_rd:g},c={c:g},lr={offset_lr:g})"
+        if round_weight:
+            self.name += f"+rounds({round_weight:g}x{round_scale:g})"
 
     def region_mean(self, region):
         vals = [self.r[p] for p in self.members[region] if self.rd[p] <= self.seed_rd]
@@ -401,8 +409,9 @@ class RegionalGlicko(PlayerGlicko):
         self._decay(m.team1_players, m.time)
         self._decay(m.team2_players, m.time)
         cross = self.offset and m.team1_region != m.team2_region
-        outcomes = [1.0 if mp.t1_won else 0.0 for mp in m.maps] if self.per_map else [1.0 if m.t1_won else 0.0]
-        for s in outcomes:
+        maps = m.maps if self.per_map else [None]
+        for mp in maps:
+            s = (1.0 if mp.t1_won else 0.0) if mp else (1.0 if m.t1_won else 0.0)
             off = self._off(m)
             r1, rd1 = self.team(m.team1_players)
             r2, rd2 = self.team(m.team2_players)
@@ -413,6 +422,12 @@ class RegionalGlicko(PlayerGlicko):
                 self.o[m.team2_region] -= d
             self._update_side(m.team1_players, r2, rd2, s, self.g(rd2) * off)
             self._update_side(m.team2_players, r1, rd1, 1.0 - s, -self.g(rd1) * off)
+            if self.round_weight and mp and mp.valid_for_margin:
+                r1, rd1 = self.team(m.team1_players)
+                r2, rd2 = self.team(m.team2_players)
+                n, share = self.round_weight * (mp.t1 + mp.t2), mp.t1_round_share
+                self._update_side(m.team1_players, r2, rd2, share, self.g(rd2) * off, self.round_scale, n)
+                self._update_side(m.team2_players, r1, rd1, 1.0 - share, -self.g(rd1) * off, self.round_scale, n)
 
 
 class Blend(Model):

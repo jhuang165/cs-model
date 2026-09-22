@@ -1,7 +1,8 @@
 """Fit the best model on all data, print current ratings, and optionally price a head-to-head.
 
 The model is the README's best: regional player Glicko blended with a daily-refit batch
-Bradley-Terry (0.7 / 0.3 on series logits), under an online logit temperature.
+Bradley-Terry (0.7 / 0.3 on series logits), under an online logit temperature. On data with
+round scores both halves also fit round margins.
 
 Usage:
   .venv/bin/python -m predict.rankings                 # top 30 rosters
@@ -33,7 +34,9 @@ def best_model(synthetic: bool):
     if synthetic:
         glicko, batch = RegionalGlicko(start_rd=150, c=20), BatchBT(tau_days=180, C=3)
     else:
-        glicko, batch = RegionalGlicko(start_rd=200, c=20), BatchBT(tau_days=365, C=10)
+        # real round scores: both halves also learn from round margins (PandaScore maps are 1-0)
+        glicko = RegionalGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25)
+        batch = BatchBT(tau_days=365, C=3, round_weight=2.0, round_scale=0.25)
     return OnlineScale(Blend(batch, glicko, w=BATCH_WEIGHT)), glicko, batch
 
 

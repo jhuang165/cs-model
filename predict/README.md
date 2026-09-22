@@ -25,7 +25,7 @@ python3 -m venv .venv && .venv/bin/pip install numpy pandas scikit-learn scipy m
 | `run_maps.py` | map-aware models scored at series level and per individual map (`--sweep` for k_map/shrink grid) |
 | `rankings.py` | fits the shipped model (regional Glicko + batch blend + temperature) on everything and prints current lineups' ratings or a matchup probability |
 | `sweep.py` | grid-search Glicko parameters on a tuning window, confirm on a later held-out window |
-| `stack.py` | stacked logistic / boosting layer over walk-forward features from the base model |
+| `stack.py` | stacked logistic / boosting layer over walk-forward features, incl. a joint refit of the shipped blend weight and temperature |
 | `regions.py` | country -> region lookup read from Valve's `model/util/region.js` (plus a CIS split) |
 | `batch.py` | time-weighted batch Bradley-Terry with a regional prior, refit daily, evaluated walk-forward |
 | `valve_baseline.py` / `.js` | runs Valve's own `model/ranking.js` weekly and scores it on the same matches and metrics |
@@ -155,6 +155,29 @@ By tier, the stacking gain is concentrated in tiers C and D (0.005 and 0.011 log
 S/A/B improve by 0.001 to 0.006 and on 500 to 700 matches that is within noise. For top-tier
 prediction the base model plus a temperature is nearly as good as the full stack.
 
+### Blend weight and temperature fitted jointly
+
+`stack.py` now also carries the shipped model's two halves as features (`z_batch`, `z_glicko`,
+series logits) and fits `P = sigmoid(a_b z_batch + a_g z_glicko)` on the training window, i.e. the
+blend weight `w = a_b / (a_b + a_g)` and the temperature `a_b + a_g` together, instead of a fixed
+0.3 and an online temperature. It also refits monthly on everything before each block (`walk_fit`),
+which is what a live refit would see. Valve sample: train Nov 2022 - Feb 2023, test from Mar 2023
+(n=3,815); PandaScore: windows as above.
+
+| test log loss | Valve sample | PandaScore |
+|---|---|---|
+| shipped (0.3 / 0.7 + online temperature) | **0.6146** | **0.6175** |
+| joint LR, fitted once (w, a) | 0.6149 (0.37, 0.74) | 0.6178 (0.50, 0.84) |
+| joint LR + intercept | 0.6135 | 0.6173 |
+| joint LR, refit monthly | 0.6145 | 0.6176 |
+| full LR, all features incl. `z_batch`/`z_glicko`, refit monthly | 0.6044 | 0.6117 |
+
+**Negative result.** The loss is flat for w between 0.2 and 0.5 (within 0.0005 on both datasets) once the
+temperature is refitted for each w, and the online temperature already tracks the offline optimum.
+The shipped weight stays. The only thing a joint fit adds is an intercept (team1 listed first,
+0.001), which the README already advises against hard-coding. The full stacker on top of the blend is
+the one that still pays (0.010 Valve, 0.006 PandaScore); see next steps.
+
 ## Regional prior (`RegionalGlicko`)
 
 Each match now carries player countries (Valve sample) or the team's PandaScore location (put in the
@@ -210,6 +233,39 @@ Findings:
 - The region columns help on the Valve sample and are neutral on PandaScore, same as for Glicko.
 - Batch and Glicko disagree enough that blending helps: 0.003 on the Valve sample, 0.001 on PandaScore.
 
+## Round scores (`round_weight`, Valve sample only)
+
+PandaScore's free plan stores every map as 1-0, so this only applies to the Valve sample (16,953 maps
+with ten or more rounds, all MR15 with overtime). Both halves of the blend get the same margin
+likelihood: a map's rounds are treated as Bernoulli trials whose logit is `round_scale` times the map
+logit, down-weighted by `round_weight` because rounds within a map are correlated (economy,
+momentum). With iid rounds, `s = 0.23` would reproduce the map-win curve of a 30-round map. The
+binary map result stays in the likelihood.
+
+- `BatchBT(round_weight=λ, round_scale=s)` adds two weighted rows per map (y=1 with weight λ·t1_rounds,
+  y=0 with weight λ·t2_rounds) whose design is scaled by `s`, which is the binomial likelihood.
+- `RegionalGlicko(round_weight=λ, round_scale=s)` does a second Glicko-1 update per map with `n = λ·rounds`
+  observations at slope `s` and the round share as the score. This is a proper likelihood, unlike the
+  stretched round-share blend in `PlayerElo`, which hurt calibration.
+
+Chosen on Mar-May 2023, confirmed on Jun-Aug 2023:
+
+| model (log loss) | tune | confirm | whole window from 2023-03 |
+|---|---|---|---|
+| batch (tau=365, C=10) + scale | 0.6114 | 0.6271 | 0.6178 |
+| ... + rounds, λ=0.5, s=0.25 | 0.6060 | 0.6201 | 0.6118 |
+| regional Glicko + scale | 0.6090 | 0.6310 | 0.6180 |
+| ... + rounds, λ=0.5, s=0.25 | 0.6009 | 0.6264 | 0.6113 |
+| previous shipped blend | 0.6061 | 0.6268 | 0.6146 |
+| **blend, batch λ=2 C=3 + Glicko λ=1, s=0.25, w=0.3** | **0.5961** | **0.6216** | **0.6066** |
+
+- Round margins are worth 0.006-0.007 to each half alone and 0.008 to the blend. This is the largest
+  single gain since the regional prior.
+- Once the rounds carry the information, the batch fit wants a stronger ridge (C=3, not 10) and more round weight.
+  Beyond λ=1 the surface is flat to within 0.001, and so is w between 0.3 and 0.5.
+- s=0.15 to 0.35 all work; 0.25 was best or tied on both halves, close to the iid value.
+- Both halves become a little more confident with rounds (online temperature 0.83 -> 0.72).
+
 ## Valve's model as a baseline (`valve_baseline.py`)
 
 Every week Valve's standings are rebuilt with `model/ranking.js` (six-month window, prize and
@@ -242,24 +298,32 @@ roster matches more than one team; the harness uses the intended maximum.
    get more than the ~0.002 map-level gain.
 4. **Tuning.** Done, see above; flat surface, little to gain.
 5. **Stacking.** Done, see above. To use it for live predictions `rankings.py` would need to
-   carry the feature extractor and a fitted model; today it only runs the base Glicko.
+   carry the feature extractor and a fitted model; today it only runs the blend. The full LR on top
+   of the current shipped model is still worth 0.006 on the Valve sample (0.6003 refit monthly vs
+   0.6066) and 0.006 on PandaScore, which makes shipping it the largest remaining gain. Its biggest non-rating
+   coefficients are the two RDs with opposite signs (an uncertain team2 favours team1), i.e.
+   newcomers are still weaker than the regional seed assumes. A cheaper fix to try first: seed
+   below the regional mean, or a learned newcomer offset.
 6. **More data.** One season is thin. The Valve JSON schema is the loader's only dependency, so a
    scrape/export in the same shape drops in without code changes.
-7. **Ship the blend.** Done, see "Shipped model" below. Still worth trying: fit the blend weight and the
-   temperature jointly in `stack.py`, and give the batch fit a margin likelihood (round scores).
+7. **Ship the blend.** Done, see "Shipped model" below.
+8. **Joint blend weight + temperature.** Done, negative: the shipped 0.3 / online temperature sits on the
+   flat optimum.
+9. **Round scores.** Done and shipped on the Valve sample (0.6146 -> 0.6066). Needs a data source with
+   round scores to matter on PandaScore (the paid Historical plan, or a different export).
 
 ## Shipped model (`rankings.py`)
 
 `rankings.best_model()` is `OnlineScale(Blend(BatchBT, RegionalGlicko, w=0.3))`, i.e. 0.3 batch /
-0.7 Glicko on series logits under an online temperature, with per-dataset settings: Glicko rd0=200 and
-batch tau=365 d, C=10 on the Valve sample; rd0=150, tau=180 d, C=3 on PandaScore (picked
-automatically from whether the rosters are synthetic `team:` ids). `run_backtest.py` scores the same
-object as its last entry:
+0.7 Glicko on series logits under an online temperature, with per-dataset settings: on the Valve sample
+Glicko rd0=200 with round margins (λ=1), batch tau=365 d, C=3 with round margins (λ=2), s=0.25;
+on PandaScore rd0=150, tau=180 d, C=3 and no rounds (picked automatically from whether the rosters
+are synthetic `team:` ids). `run_backtest.py` scores the same object as its last entry:
 
 | | Valve sample (from 2023-03) | PandaScore (from 2025-07) |
 |---|---|---|
-| log loss / acc / auc | 0.6146 / 0.663 / 0.711 | 0.6175 / 0.655 / 0.708 |
-| learned temperature | 0.83 | 0.76 |
+| log loss / acc / auc | 0.6066 / 0.669 / 0.721 | 0.6175 / 0.655 / 0.708 |
+| learned temperature | 0.72 | 0.76 |
 
 - **Head-to-heads** (`--vs A B --bo N`) run the full model on a synthetic match between the two
   current lineups, so they carry the BO conversion, region effects and temperature. The implied
@@ -267,4 +331,5 @@ object as its last entry:
 - **The displayed rating** is `1500 + a * (0.3 * batch + 0.7 * Glicko)` on the Elo scale, both halves
   including their region effects. It orders teams the way the model does but is only approximate
   for pricing; use `--vs` for that. The ± is the Glicko team RD.
-- A full PandaScore run takes about 90 s (daily batch refits over three years); the Valve sample about 14 s.
+- A full PandaScore run takes about 90 s (daily batch refits over three years); the Valve sample about
+  25 s (the round rows triple the batch fit's size).
