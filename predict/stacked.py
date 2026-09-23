@@ -2,7 +2,7 @@
 
 `Stacked(inner, glicko, batch)` wraps the shipped `OnlineScale(Blend(batch, glicko))`. For every match
 it builds a feature row before anything updates (the blend and both halves' logits, Glicko team
-RDs, experience, rest, recent form, format and event size), and once a label arrives the row joins the
+RDs and the blend logit times their sum, experience, rest, recent form, format and event size), and once a label arrives the row joins the
 training set. Every `refit_days` a standardized L2 logistic regression is refit on all rows collected
 so far; until `min_rows` rows exist it passes the inner prediction through unchanged. Everything it
 predicts is from rows strictly before the match, so it runs under `evaluate.walk_forward` as is.
@@ -22,7 +22,7 @@ from sklearn.linear_model import LogisticRegression
 from .models import Model
 
 DAY = 86400
-NAMES = (["z_shipped", "z_batch", "z_glicko", "rd1", "rd2", "bo1", "bo3", "bo5", "logprize", "lan"]
+NAMES = (["z_shipped", "z_batch", "z_glicko", "rd1", "rd2", "z_x_rd", "bo1", "bo3", "bo5", "logprize", "lan"]
          + [f"t{i}_{k}" for i in (1, 2) for k in ("rest", "logn", "plogn", "form", "nrec")])
 
 
@@ -61,7 +61,9 @@ class Stacked(Model):
         p = self.inner.predict(m)             # registers newcomers in Glicko before we read RDs
         _, rd1 = self.glicko.team(m.team1_players)
         _, rd2 = self.glicko.team(m.team2_players)
-        f = [_logit(p), _logit(self.batch.predict(m)), _logit(self.glicko.predict(m)), rd1 / 100, rd2 / 100]
+        z = _logit(p)
+        # z_x_rd lets the stacker shrink the blend's logit when either lineup's rating is uncertain
+        f = [z, _logit(self.batch.predict(m)), _logit(self.glicko.predict(m)), rd1 / 100, rd2 / 100, z * (rd1 + rd2) / 100]
         f += [1.0 if m.best_of == b else 0.0 for b in (1, 3, 5)]
         f += [math.log1p(m.prize_pool) / 10, 1.0 if m.lan else 0.0]
         f += self._team(m.team1_id, m.team1_players, m.time) + self._team(m.team2_id, m.team2_players, m.time)

@@ -362,8 +362,14 @@ class RegionalGlicko(PlayerGlicko):
 
     def __init__(self, seed: bool = True, offset: bool = True, seed_rd: float = float("inf"),
                  offset_lr: float = 2.0, start_rd: float = 150.0, c: float = 20.0, min_rd: float = 30.0,
-                 round_weight: float = 0.0, round_scale: float = 0.25, seed_offset: float = 0.0, **kw):
+                 round_weight: float = 0.0, round_scale: float = 0.25, seed_offset: float = 0.0,
+                 exp_lr: float = 0.0, exp_beta: float = 0.0, exp_maps: float = 0.0, **kw):
         super().__init__(start_rd=start_rd, c=c, min_rd=min_rd, **kw)
+        # experience term (off by default, not shipped; see README): team strength gets exp_beta rating points
+        # times the players' mean experience, log1p(maps played) or, with exp_maps > 0, 1 - exp(-maps / exp_maps).
+        # exp_lr > 0 learns exp_beta online like the region offset. rankings.display_rating ignores it.
+        self.exp_lr, self.exp_beta, self.exp_maps = exp_lr, exp_beta, exp_maps
+        self.nmaps = defaultdict(int)             # player -> maps played
         # seed_offset: rating points added to a newcomer's regional seed (negative = newcomers are weaker)
         self.seed_offset = seed_offset
         # round_weight > 0: after each map's binary update, a second update treating the map's rounds
@@ -379,6 +385,8 @@ class RegionalGlicko(PlayerGlicko):
             self.name += f"+seedoff({seed_offset:g})"
         if round_weight:
             self.name += f"+rounds({round_weight:g}x{round_scale:g})"
+        if exp_lr or exp_beta:
+            self.name += f"+exp(b0={exp_beta:g},lr={exp_lr:g},maps={exp_maps:g})"
 
     def region_mean(self, region):
         vals = [self.r[p] for p in self.members[region] if self.rd[p] <= self.seed_rd]
@@ -395,10 +403,16 @@ class RegionalGlicko(PlayerGlicko):
                 self.r[p] = self.region_mean(reg) + self.seed_offset
             self.members[reg].add(p)
 
+    def experience(self, players):
+        if self.exp_maps:  # saturating: 1 - exp(-maps / exp_maps)
+            return sum(1 - math.exp(-self.nmaps[p] / self.exp_maps) for p in players) / len(players)
+        return sum(math.log1p(self.nmaps[p]) for p in players) / len(players)
+
     def _off(self, m):
-        if not self.offset:
-            return 0.0
-        return self.o[m.team1_region] - self.o[m.team2_region]
+        off = self.o[m.team1_region] - self.o[m.team2_region] if self.offset else 0.0
+        if self.exp_beta or self.exp_lr:
+            off += self.exp_beta * (self.experience(m.team1_players) - self.experience(m.team2_players))
+        return off
 
     def _p_map(self, m):
         self._register(m.team1_players, m.team1_countries)
@@ -419,11 +433,13 @@ class RegionalGlicko(PlayerGlicko):
             off = self._off(m)
             r1, rd1 = self.team(m.team1_players)
             r2, rd2 = self.team(m.team2_players)
+            p = elo_expected(self.g(math.sqrt(rd1 ** 2 + rd2 ** 2)) * (r1 - r2 + off))
             if cross:
-                p = elo_expected(self.g(math.sqrt(rd1 ** 2 + rd2 ** 2)) * (r1 - r2 + off))
                 d = self.offset_lr * (s - p)
                 self.o[m.team1_region] += d
                 self.o[m.team2_region] -= d
+            if self.exp_lr:
+                self.exp_beta += self.exp_lr * (s - p) * (self.experience(m.team1_players) - self.experience(m.team2_players))
             self._update_side(m.team1_players, r2, rd2, s, self.g(rd2) * off)
             self._update_side(m.team2_players, r1, rd1, 1.0 - s, -self.g(rd1) * off)
             if self.round_weight and mp and mp.valid_for_margin:
@@ -432,6 +448,8 @@ class RegionalGlicko(PlayerGlicko):
                 n, share = self.round_weight * (mp.t1 + mp.t2), mp.t1_round_share
                 self._update_side(m.team1_players, r2, rd2, share, self.g(rd2) * off, self.round_scale, n)
                 self._update_side(m.team2_players, r1, rd1, 1.0 - share, -self.g(rd1) * off, self.round_scale, n)
+        for p in m.team1_players + m.team2_players:
+            self.nmaps[p] += len(maps)
 
 
 class Blend(Model):
