@@ -1,8 +1,9 @@
 """Fit the best model on all data, print current ratings, and optionally price a head-to-head.
 
 The model is the README's best: regional player Glicko blended with a daily-refit batch
-Bradley-Terry (0.7 / 0.3 on series logits), under an online logit temperature. On data with
-round scores both halves also fit round margins.
+Bradley-Terry (0.7 / 0.3 on series logits), under an online logit temperature, with a logistic
+stacking layer on top (refit monthly on its own past rows; see stacked.py). On data with round
+scores both halves also fit round margins.
 
 Usage:
   .venv/bin/python -m predict.rankings                 # top 30 rosters
@@ -19,6 +20,7 @@ from .batch import ELO_PER_LOGIT, BatchBT
 from .data import DEFAULT_DATA, load_matches
 from .models import Blend, OnlineScale, RegionalGlicko, series_prob
 from .regions import team_region
+from .stacked import Stacked
 
 BATCH_WEIGHT = 0.3
 
@@ -28,16 +30,18 @@ def synthetic_rosters(matches) -> bool:
     return any(p.startswith("team:") for m in matches[:50] for p in m.team1_players)
 
 
-def best_model(synthetic: bool):
+def best_model(synthetic: bool, stacked: bool = True):
     # Tuned per dataset (see README): entities are players on the Valve sample and teams on
-    # PandaScore, which moves the batch fit's best half-life and ridge strength.
+    # PandaScore, which moves the batch fit's best half-life and ridge strength. Newcomers are
+    # seeded below their region's mean (seed_offset): unknown lineups lose more than average.
     if synthetic:
-        glicko, batch = RegionalGlicko(start_rd=150, c=20), BatchBT(tau_days=180, C=3)
+        glicko, batch = RegionalGlicko(start_rd=150, c=20, seed_offset=-100), BatchBT(tau_days=180, C=3)
     else:
         # real round scores: both halves also learn from round margins (PandaScore maps are 1-0)
-        glicko = RegionalGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25)
+        glicko = RegionalGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25, seed_offset=-200)
         batch = BatchBT(tau_days=365, C=3, round_weight=2.0, round_scale=0.25)
-    return OnlineScale(Blend(batch, glicko, w=BATCH_WEIGHT)), glicko, batch
+    blend = OnlineScale(Blend(batch, glicko, w=BATCH_WEIGHT))
+    return (Stacked(blend, glicko, batch) if stacked else blend), glicko, batch
 
 
 def current_lineups(matches):
@@ -61,8 +65,10 @@ def display_rating(model, glicko, batch, players, region):
     """Blend of the two halves on the Elo scale, times the learned temperature.
 
     Only differences are meaningful. This is linear in map strength, so it ranks teams the way
-    the blend does, but head-to-head prices should come from model.predict (series logits).
+    the blend does (the stacking layer on top is ignored), but head-to-head prices should come
+    from model.predict (series logits plus the stacker's context features).
     """
+    model = getattr(model, "inner", model)  # the OnlineScale blend under the stacker
     rg, rd = glicko.team(players)
     rg += glicko.o[region]
     rb = batch.rating(players)
@@ -107,7 +113,7 @@ def main():
             continue
         region = team_region(countries)
         r, rd = display_rating(model, glicko, batch, players, region)
-        rows.append((r, rd, name, counts[tid], last, region, players, countries))
+        rows.append((r, rd, name, counts[tid], last, region, players, countries, tid))
     rows.sort(reverse=True)
 
     if args.vs:
@@ -118,7 +124,8 @@ def main():
             exact = [x for x in hits if x[2].lower() == q.lower()]
             return (exact or hits)[0]
         a, b = find(args.vs[0]), find(args.vs[1])
-        m = dataclasses.replace(matches[-1], time=now + 1, team1_name=a[2], team2_name=b[2],
+        # event fields (prize pool, LAN) are the last match's; the stacker reads them
+        m = dataclasses.replace(matches[-1], time=now + 1, team1_id=a[8], team2_id=b[8], team1_name=a[2], team2_name=b[2],
                                 team1_players=a[6], team2_players=b[6],
                                 team1_countries=a[7], team2_countries=b[7], best_of=args.bo)
         p = model.predict(m)
@@ -127,7 +134,7 @@ def main():
         return
 
     asof = dt.datetime.fromtimestamp(now, dt.timezone.utc).date()
-    print(f"ratings as of {asof} (regional Glicko + batch Bradley-Terry blend, temperature {model.a:.2f};"
+    print(f"ratings as of {asof} (regional Glicko + batch Bradley-Terry blend, temperature {model.inner.a:.2f};"
           f" rating incl. region effects ± Glicko team RD)")
     print(f"{'#':>3s} {'team':28s} {'rating':>7s} {'rd':>4s} {'games':>5s} {'reg':>4s}  last played")
     for i, (r, rd, name, n, last, region, *_) in enumerate(rows[: args.top], 1):

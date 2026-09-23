@@ -47,7 +47,7 @@ class FeatureExtractor:
     def __init__(self, tiers, synthetic, **glicko_kw):
         self.model = PlayerGlicko(**glicko_kw)
         # the shipped model and its two halves, so the blend weight and temperature can be refit
-        self.shipped, self.glicko, self.batch = best_model(synthetic)
+        self.shipped, self.glicko, self.batch = best_model(synthetic, stacked=False)
         self.tiers = tiers
         self.last = {}                      # team -> last match time
         self.n = defaultdict(int)           # team -> series played

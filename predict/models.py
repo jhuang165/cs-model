@@ -362,8 +362,10 @@ class RegionalGlicko(PlayerGlicko):
 
     def __init__(self, seed: bool = True, offset: bool = True, seed_rd: float = float("inf"),
                  offset_lr: float = 2.0, start_rd: float = 150.0, c: float = 20.0, min_rd: float = 30.0,
-                 round_weight: float = 0.0, round_scale: float = 0.25, **kw):
+                 round_weight: float = 0.0, round_scale: float = 0.25, seed_offset: float = 0.0, **kw):
         super().__init__(start_rd=start_rd, c=c, min_rd=min_rd, **kw)
+        # seed_offset: rating points added to a newcomer's regional seed (negative = newcomers are weaker)
+        self.seed_offset = seed_offset
         # round_weight > 0: after each map's binary update, a second update treating the map's rounds
         # as round_weight * rounds Bernoulli observations on a logit scale of round_scale (see BatchBT)
         self.round_weight, self.round_scale = round_weight, round_scale
@@ -373,6 +375,8 @@ class RegionalGlicko(PlayerGlicko):
         self.o = defaultdict(float)               # region -> rating-point offset
         tag = "+".join(x for x, on in (("seed", seed), ("offset", offset)) if on) or "none"
         self.name = f"regional-glicko[{tag}](rd0={start_rd:g},c={c:g},lr={offset_lr:g})"
+        if seed_offset:
+            self.name += f"+seedoff({seed_offset:g})"
         if round_weight:
             self.name += f"+rounds({round_weight:g}x{round_scale:g})"
 
@@ -388,7 +392,7 @@ class RegionalGlicko(PlayerGlicko):
             reg = country_region(cc)
             self.region_of[p] = reg
             if self.seed:
-                self.r[p] = self.region_mean(reg)
+                self.r[p] = self.region_mean(reg) + self.seed_offset
             self.members[reg].add(p)
 
     def _off(self, m):

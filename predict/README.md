@@ -25,7 +25,8 @@ python3 -m venv .venv && .venv/bin/pip install numpy pandas scikit-learn scipy m
 | `run_maps.py` | map-aware models scored at series level and per individual map (`--sweep` for k_map/shrink grid) |
 | `rankings.py` | fits the shipped model (regional Glicko + batch blend + temperature) on everything and prints current lineups' ratings or a matchup probability |
 | `sweep.py` | grid-search Glicko parameters on a tuning window, confirm on a later held-out window |
-| `stack.py` | stacked logistic / boosting layer over walk-forward features, incl. a joint refit of the shipped blend weight and temperature |
+| `stack.py` | offline stacking experiments: logistic / boosting over walk-forward features, incl. a joint refit of the shipped blend weight and temperature |
+| `stacked.py` | `Stacked`: the shipped stacking layer, a logistic regression over the blend refit monthly on its own past rows; `-m predict.stacked` compares it with the bare blend |
 | `regions.py` | country -> region lookup read from Valve's `model/util/region.js` (plus a CIS split) |
 | `batch.py` | time-weighted batch Bradley-Terry with a regional prior, refit daily, evaluated walk-forward |
 | `valve_baseline.py` / `.js` | runs Valve's own `model/ranking.js` weekly and scores it on the same matches and metrics |
@@ -266,6 +267,55 @@ Chosen on Mar-May 2023, confirmed on Jun-Aug 2023:
 - s=0.15 to 0.35 all work; 0.25 was best or tied on both halves, close to the iid value.
 - Both halves become a little more confident with rounds (online temperature 0.83 -> 0.72).
 
+## Newcomer seed offset (`seed_offset`)
+
+The stacker's largest non-rating coefficients were the two Glicko RDs with opposite signs: an
+uncertain opponent favours you, i.e. new lineups lose more than the regional seed (the plain mean of
+the region) predicts. `RegionalGlicko(seed_offset=d)` seeds a new player at the region mean plus `d`
+rating points. Shipped blend, same tune/confirm windows as above (PandaScore: tune Jul 2024 - Jun 2025,
+confirm from Jul 2025):
+
+| seed_offset | Valve tune | Valve confirm | PandaScore tune | PandaScore confirm |
+|---|---|---|---|---|
+| 0 | 0.5961 | 0.6216 | 0.6295 | 0.6175 |
+| -50 | 0.5939 | 0.6198 | 0.6277 | 0.6158 |
+| -100 | 0.5924 | 0.6184 | **0.6270** | **0.6148** |
+| -150 | 0.5915 | 0.6172 | 0.6272 | 0.6144 |
+| -200 | **0.5910** | **0.6164** | 0.6281 | 0.6145 |
+| -300 | 0.5913 | 0.6157 | 0.6314 | 0.6159 |
+
+Shipped at -200 on the Valve sample (per player, so a whole new five-man roster starts 200 below the
+region mean) and -100 on PandaScore (per team). The Valve blend's whole window improves to 0.6014 from
+0.6066, and PandaScore's confirm window to 0.6148 from 0.6175. Region means include the seeded newcomers,
+so the displayed rating scale drifts down over time; only differences are meaningful.
+
+## Live stacking layer (`stacked.py`)
+
+`Stacked(blend, glicko, batch)` puts a standardized L2 logistic regression (C=1) on top of the shipped
+blend. Its 20 features are built before each match updates anything:
+- the blend, batch and Glicko series logits
+- both Glicko team RDs
+- best-of dummies, log prize pool and LAN
+- per team: rest days, log series played by the team id, mean log series played by its players,
+  last-10 form and how many of those 10 exist.
+
+It is refit every 30 days on every labelled row after a 60-day burn-in. It passes the blend
+through until 1,000 rows exist. Tier is left out because it is not on `Match`. Walk-forward, with the
+newcomer offset in both columns:
+
+| log loss / acc / auc / ece | Valve sample (from 2023-03) | PandaScore (from 2025-07) |
+|---|---|---|
+| blend (shipped before) | 0.6014 / 0.674 / 0.728 / 0.030 | 0.6148 / 0.657 / 0.712 / 0.014 |
+| **stacked** | **0.5987 / 0.673 / 0.731 / 0.021** | **0.6119 / 0.660 / 0.716 / 0.009** |
+| `stack.py` full LR refit monthly (offline reference) | 0.5990 | 0.6113 |
+
+- The gain is 0.003 on both datasets and matches the offline estimate. Most of it is calibration (ECE).
+- Insensitive to settings: C from 0.1 to 10 and burn-in from 0 to 300 days are all within 0.001.
+- Coefficients (last Valve fit, standardized): blend logit +0.42, batch +0.30, Glicko +0.18, then player
+  experience (+0.25 own, -0.30 opponent's); inexperienced lineups are still overrated even after the seed
+  offset. Recent form is small and negative (mean reversion). On PandaScore the best-of dummies carry
+  a large weight: the stacker re-learns the map-to-series conversion and the team1 intercept.
+
 ## Valve's model as a baseline (`valve_baseline.py`)
 
 Every week Valve's standings are rebuilt with `model/ranking.js` (six-month window, prize and
@@ -297,13 +347,10 @@ roster matches more than one team; the harness uses the intended maximum.
 3. **Map pool.** Tried, see above. Would need pick/ban data (which team picked which map) to
    get more than the ~0.002 map-level gain.
 4. **Tuning.** Done, see above; flat surface, little to gain.
-5. **Stacking.** Done, see above. To use it for live predictions `rankings.py` would need to
-   carry the feature extractor and a fitted model; today it only runs the blend. The full LR on top
-   of the current shipped model is still worth 0.006 on the Valve sample (0.6003 refit monthly vs
-   0.6066) and 0.006 on PandaScore, which makes shipping it the largest remaining gain. Its biggest non-rating
-   coefficients are the two RDs with opposite signs (an uncertain team2 favours team1), i.e.
-   newcomers are still weaker than the regional seed assumes. A cheaper fix to try first: seed
-   below the regional mean, or a learned newcomer offset.
+5. **Stacking.** Done and shipped (`stacked.py`, 0.003 on both datasets). Its RD coefficients led to
+   the newcomer seed offset (also shipped, 0.003 to 0.005). The stacker still leans on player
+   experience, so a Glicko that lowers a newcomer's rating by games played, not only at the seed, might
+   take more of this into the base model. Tier would need adding to `Match`.
 6. **More data.** One season is thin. The Valve JSON schema is the loader's only dependency, so a
    scrape/export in the same shape drops in without code changes.
 7. **Ship the blend.** Done, see "Shipped model" below.
@@ -314,21 +361,23 @@ roster matches more than one team; the harness uses the intended maximum.
 
 ## Shipped model (`rankings.py`)
 
-`rankings.best_model()` is `OnlineScale(Blend(BatchBT, RegionalGlicko, w=0.3))`, i.e. 0.3 batch /
-0.7 Glicko on series logits under an online temperature, with per-dataset settings: on the Valve sample
-Glicko rd0=200 with round margins (λ=1), batch tau=365 d, C=3 with round margins (λ=2), s=0.25;
-on PandaScore rd0=150, tau=180 d, C=3 and no rounds (picked automatically from whether the rosters
-are synthetic `team:` ids). `run_backtest.py` scores the same object as its last entry:
+`rankings.best_model()` is `Stacked(OnlineScale(Blend(BatchBT, RegionalGlicko, w=0.3)))`, i.e. 0.3 batch /
+0.7 Glicko on series logits under an online temperature, with the logistic stacking layer on top
+(`best_model(..., stacked=False)` returns the bare blend). Per-dataset settings: on the Valve sample
+Glicko rd0=200, newcomer seed -200, round margins (λ=1); batch tau=365 d, C=3, round margins (λ=2); s=0.25.
+On PandaScore rd0=150, newcomer seed -100, tau=180 d, C=3 and no rounds. The dataset is detected from
+whether the rosters are synthetic `team:` ids. `run_backtest.py` scores the same object as its last entry:
 
 | | Valve sample (from 2023-03) | PandaScore (from 2025-07) |
 |---|---|---|
-| log loss / acc / auc | 0.6066 / 0.669 / 0.721 | 0.6175 / 0.655 / 0.708 |
-| learned temperature | 0.72 | 0.76 |
+| log loss / acc / auc / ece | 0.5987 / 0.673 / 0.731 / 0.021 | 0.6119 / 0.660 / 0.716 / 0.009 |
+| learned temperature (blend) | 0.70 | 0.72 |
 
 - **Head-to-heads** (`--vs A B --bo N`) run the full model on a synthetic match between the two
-  current lineups, so they carry the BO conversion, region effects and temperature. The implied
+  current lineups, so they carry the BO conversion, region effects, temperature and the stacker's
+  team features (rest, experience, form). Prize pool and LAN are copied from the last match in the data. The implied
   per-map probability is backed out of the series price.
-- **The displayed rating** is `1500 + a * (0.3 * batch + 0.7 * Glicko)` on the Elo scale, both halves
+- **The displayed rating** ignores the stacker. It is `1500 + a * (0.3 * batch + 0.7 * Glicko)` on the Elo scale, both halves
   including their region effects. It orders teams the way the model does but is only approximate
   for pricing; use `--vs` for that. The ± is the Glicko team RD.
 - A full PandaScore run takes about 90 s (daily batch refits over three years); the Valve sample about
