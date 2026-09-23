@@ -31,6 +31,7 @@ python3 -m venv .venv && .venv/bin/pip install numpy pandas scikit-learn scipy m
 | `batch.py` | time-weighted batch Bradley-Terry with a regional prior, refit daily, evaluated walk-forward |
 | `valve_baseline.py` / `.js` | runs Valve's own `model/ranking.js` weekly and scores it on the same matches and metrics |
 | `pandascore_export.py` | pulls CS matches from the PandaScore free tier into Valve's schema (`data/matchdata_pandascore.json`) |
+| `live_rosters.py` | attaches real lineups from Valve's standings detail pages to the PandaScore export (`--causal` for leak-free coverage); not shipped |
 
 Every runner takes `--data <file>` to point at a different Valve-schema file.
 
@@ -372,6 +373,38 @@ so the term is not shipped. It is also large and awkward: a brand-new lineup sit
 below a settled one. On PandaScore, where entities are teams, every setting is within 0.0003 of the shipped model.
 The constructor keeps it off by default (`exp_beta=0`).
 
+## Real lineups on PandaScore (`live_rosters.py`, negative: the gain is leakage)
+
+Valve's published standings (`live/<year>/details/<snapshot>/*.md`) list, for every ranked roster, the
+matches behind its standing with the five nicks that played. `live_rosters.py` joins these to the PandaScore
+export by date and team name (ids are mapped by name, then corrected by voting on same-day opponents to catch
+renames) and replaces the synthetic `team:<id>` player with the real lineup where it can. 59k of 90k match
+sides get a lineup. `models.LinkedGlicko` carries a team's rating across the switch between its synthetic
+entity and its players; without it the file scores worse than the plain export.
+
+The catch is that pages exist only for teams **ranked at some later snapshot**. So a lineup is attached
+exactly when the team is going to do well enough to be ranked: a new team that turns out good gets its players'
+existing ratings, and one that flops keeps the newcomer seed. `--causal` removes this by attaching lineups only
+for teams already ranked at a snapshot before the match (43k sides). Paired log-loss differences vs the plain
+export (tune Jul 2024 - Jun 2025, confirm from Jul 2025):
+
+| model | coverage | tune | confirm | confirm, one side real |
+|---|---|---|---|---|
+| Glicko + scale | as found (leaky) | -0.0015 ± 0.0013 | -0.0077 ± 0.0014 | -0.0124 ± 0.0034 |
+| Glicko + scale | causal | +0.0023 ± 0.0010 | -0.0012 ± 0.0011 | +0.0020 ± 0.0023 |
+| shipped stacked blend | as found (leaky) | +0.0019 ± 0.0013 | -0.0068 ± 0.0014 | -0.0180 ± 0.0036 |
+| shipped stacked blend | causal | **+0.0085 ± 0.0012** | +0.0005 ± 0.0012 | +0.0020 ± 0.0025 |
+
+The leaky file looks like a 0.007 win, and it is largest on matches where only one side has a lineup, which is
+where "this team has a lineup" means "this team will be ranked". Once coverage is causal, nothing is left:
+Glicko gains 0.001 on the confirm window and loses 0.002 on the tune window, and the full model loses on both.
+The batch half has no link between a team's two representations, which is probably why the full model does worse than Glicko alone.
+Not shipped. `rankings.best_model` stays on `RegionalGlicko`, and `LinkedGlicko` is kept for reference.
+
+Also tried and found to be a no-op: pooling team RD as `rms(player RD) / n^p` with p = 0 or 0.25 instead of 0.5,
+so that a five-man lineup is not √5 times more certain than a synthetic team with the same history.
+Every setting was within 0.0002 on both datasets.
+
 ## Valve's model as a baseline (`valve_baseline.py`)
 
 Every week Valve's standings are rebuilt with `model/ranking.js` (six-month window, prize and
@@ -409,7 +442,9 @@ roster matches more than one team; the harness uses the intended maximum.
    roster-continuity features were tried and did not hold up on held-out data (see above).
 10. **Where the remaining loss is.** The context features are exhausted, and the stacker's gains are
    now calibration, not ranking (AUC moved 0.728 -> 0.731 on Valve). Further gains most likely need new
-   information: pick/ban order, round scores on PandaScore, or more seasons of real rosters.
+   information: pick/ban order or round scores on PandaScore. Real lineups taken from Valve's standings
+   pages were tried and gave nothing once the coverage was made causal (see above). A lineup source
+   that does not depend on later rankings (e.g. HLTV match pages) would be a fair retest.
 6. **More data.** One season is thin. The Valve JSON schema is the loader's only dependency, so a
    scrape/export in the same shape drops in without code changes.
 7. **Ship the blend.** Done, see "Shipped model" below.

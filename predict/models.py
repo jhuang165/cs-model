@@ -471,3 +471,50 @@ class Blend(Model):
     def update(self, m):
         self.a.update(m)
         self.b.update(m)
+
+
+class LinkedGlicko(RegionalGlicko):
+    """RegionalGlicko for files that mix real lineups with synthetic `team:<id>` stand-ins
+    (the PandaScore export with Valve rosters attached, see live_rosters.py).
+
+    A team moves between the two representations as its lineup coverage comes and goes. Without a
+    link, its first real lineup is five newcomers at the regional seed and its synthetic rating is
+    abandoned, which throws away the team's history. Here a new player on a team whose synthetic entity
+    exists starts at that entity's rating, and a new synthetic entity starts at the mean of the team's
+    last real lineup. On files with only one representation it is identical to RegionalGlicko.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.last_lineup = {}                     # team id -> last real lineup
+        self.name += "+linked"
+
+    def _seed_at(self, p, cc, r):
+        from .regions import country_region
+        reg = country_region(cc)
+        self.region_of[p] = reg
+        self.r[p] = r
+        self.members[reg].add(p)
+
+    def _link(self, m):
+        for tid, players, countries in ((m.team1_id, m.team1_players, m.team1_countries),
+                                        (m.team2_id, m.team2_players, m.team2_countries)):
+            syn = f"team:{tid}"
+            if players[0] == syn:
+                if syn not in self.region_of and tid in self.last_lineup:
+                    lineup = self.last_lineup[tid]
+                    self._seed_at(syn, countries[0], sum(self.r[p] for p in lineup) / len(lineup))
+            else:
+                if syn in self.region_of:
+                    for p, cc in zip(players, countries):
+                        if p not in self.region_of:
+                            self._seed_at(p, cc, self.r[syn])
+                self.last_lineup[tid] = players
+
+    def _p_map(self, m):
+        self._link(m)
+        return super()._p_map(m)
+
+    def update(self, m):
+        self._link(m)
+        super().update(m)
