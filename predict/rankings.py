@@ -18,7 +18,7 @@ import datetime as dt
 
 from .batch import ELO_PER_LOGIT, BatchBT
 from .data import DEFAULT_DATA, load_matches
-from .models import Blend, OnlineScale, RegionalGlicko, series_prob
+from .models import Blend, LinkedGlicko, OnlineScale, RegionalGlicko, series_prob
 from .regions import team_region
 from .stacked import Stacked
 
@@ -26,8 +26,9 @@ BATCH_WEIGHT = 0.3
 
 
 def synthetic_rosters(matches) -> bool:
-    """PandaScore exports stand a single `team:<id>` entry in for the lineup."""
-    return any(p.startswith("team:") for m in matches[:50] for p in m.team1_players)
+    """PandaScore exports stand a single `team:<id>` entry in for every lineup; the Liquipedia export
+    only for the ~10% of sides without a TeamCard, so decide by majority."""
+    return sum(m.team1_players[0].startswith("team:") for m in matches) > len(matches) / 2
 
 
 def best_model(synthetic: bool, stacked: bool = True):
@@ -37,8 +38,10 @@ def best_model(synthetic: bool, stacked: bool = True):
     if synthetic:
         glicko, batch = RegionalGlicko(start_rd=150, c=20, seed_offset=-100), BatchBT(tau_days=180, C=3)
     else:
-        # real round scores: both halves also learn from round margins (PandaScore maps are 1-0)
-        glicko = RegionalGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25, seed_offset=-200)
+        # real lineups and round scores (Valve sample, Liquipedia): both halves also learn from round
+        # margins. LinkedGlicko carries ratings across Liquipedia sides that fall back to a synthetic
+        # team player; on files without synthetic players it is plain RegionalGlicko.
+        glicko = LinkedGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25, seed_offset=-200)
         batch = BatchBT(tau_days=365, C=3, round_weight=2.0, round_scale=0.25)
     blend = OnlineScale(Blend(batch, glicko, w=BATCH_WEIGHT))
     return (Stacked(blend, glicko, batch) if stacked else blend), glicko, batch

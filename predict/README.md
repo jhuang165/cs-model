@@ -32,6 +32,8 @@ python3 -m venv .venv && .venv/bin/pip install numpy pandas scikit-learn scipy m
 | `valve_baseline.py` / `.js` | runs Valve's own `model/ranking.js` weekly and scores it on the same matches and metrics |
 | `pandascore_export.py` | pulls CS matches from the PandaScore free tier into Valve's schema (`data/matchdata_pandascore.json`) |
 | `live_rosters.py` | attaches real lineups from Valve's standings detail pages to the PandaScore export (`--causal` for leak-free coverage); not shipped |
+| `liquipedia.py` | polite, disk-cached client for Liquipedia's MediaWiki API (rate limit, User-Agent with contact, gzip) |
+| `liquipedia_export.py` | builds `data/matchdata_liquipedia.json` from Liquipedia's CS2 tournament pages: lineups (TeamCard and TeamParticipants), round scores, map names, LAN, tier |
 
 Every runner takes `--data <file>` to point at a different Valve-schema file.
 
@@ -405,6 +407,98 @@ Also tried and found to be a no-op: pooling team RD as `rms(player RD) / n^p` wi
 so that a five-man lineup is not √5 times more certain than a synthetic team with the same history.
 Every setting was within 0.0002 on both datasets.
 
+## Liquipedia: lineups and round scores for 2023-2026 (`liquipedia_export.py`; better overall, level with PandaScore at the top)
+
+```
+.venv/bin/python -m predict.liquipedia_export --fetch      # first run: ~4 min pages, ~25 min team names, ~20 min countries
+.venv/bin/python -m predict.liquipedia_export              # rebuild from the cache, no network
+.venv/bin/python -m predict.run_backtest --data data/matchdata_liquipedia.json --eval-from 2025-07-01
+```
+
+Every page in Liquipedia's `Category:CS2 Tournaments` (4,464 pages, Feb 2023 - Sep 2026) is fetched as
+wikitext through the MediaWiki API, 50 pages per request (90 requests, 51 MB, cached in `data/liquipedia/`).
+Per the [API terms](https://liquipedia.net/api-terms-of-use) the client waits 2.5 s between calls and 30 s
+between `expandtemplates` calls, sends gzip and a User-Agent with contact info (`git config user.email`
+unless `LIQUIPEDIA_CONTACT` is set), and never requests anything twice. Data from Liquipedia is CC-BY-SA 3.0.
+
+A tournament page carries, in wikitext:
+- `{{Infobox league}}`: dates, prize pool in USD, Liquipedia tier, Online/Offline (-> LAN)
+- `{{Match}}`: both team template keys, start time with a timezone, and per map the map name and round
+  scores by half plus overtime, and the HLTV match id
+- `{{TeamCard}}`: each participant's five players at that event (`|pNlink=` disambiguates nicks)
+- `{{TeamParticipants}}`: the same in the newer format that most S/A pages use from 2025,
+  `{{Opponent|<team>|players={{Persons|{{Person|<nick>|link=|flag=|role=|played=}}...}}}}`. Coaches, staff
+  and former players are skipped; a `role=sub` (or `csub=true` coach) fills in for a starter marked `played=false`
+
+Team keys and TeamCard names are resolved to team page titles with `{{Team|key}}` (51 `expandtemplates`
+calls). Result: 53,055 matches (2,811 walkovers dropped), round scores on all but 11 of 108,503 maps, a
+lineup for 94% of sides and both lineups in 89% of matches (S-Tier: all but 5 of 3,134 sides). A side without one is a synthetic
+`team:<title>` player, linked to the team's players by `LinkedGlicko`. Player countries come from TeamCard
+flags where given, otherwise from the lead section of the player's own page (`{{Infobox player|country=}}`,
+fetched 50 at a time with `rvsection=0`); 94% of player slots get one. Fetching the page countries on top of
+the flags changed the log loss by less than 0.002.
+
+**Is lineup coverage leak-free?** Unlike Valve's standings pages, a TeamCard is written for every
+participant of an event, whatever the team goes on to do. Two checks agree:
+- The lineup gain sits in matches where *both* sides have lineups, not where one does (the leak's signature
+  on the Valve pages). Liquipedia with lineups vs the same file with every side synthetic (`--no-lineups`),
+  paired on identical matches: both lineups -0.023 / -0.027 (tune / confirm, SE 0.002); one lineup
+  -0.001 ± 0.006 / -0.007 ± 0.007.
+- When only one side has a lineup, that side wins as often as the lineup-blind model predicts
+  (tune 50.6% vs 52.2%, z = -1.6; confirm 55.8% vs 54.9%, z = +0.9). With `TeamParticipants` added,
+  against the teams-only Glicko: tune 50.7% vs 52.4%, z = -2.0; confirm 55.8% vs 55.6%, z = +0.3.
+  `TeamParticipants` is written like a TeamCard, as teams qualify; only `played=false` is after the fact,
+  and a starting lineup is public at match time.
+
+Stack from `best_model` (tune Jul 2024 - Jun 2025, confirm from Jul 2025; each file on its own matches; the
+first four Liquipedia rows are before the page countries were added):
+
+| file / settings | tune | confirm |
+|---|---|---|
+| PandaScore (teams, binary maps), shipped PandaScore settings | 0.6249 | 0.6108 |
+| Liquipedia `--no-lineups`, same settings | 0.6205 | 0.6066 |
+| ... + round margins (λ=1 Glicko, λ=2 batch, s=0.25) | 0.6117 | 0.5984 |
+| Liquipedia with lineups, same | 0.5955 | 0.5806 |
+| **Liquipedia with lineups, Valve-sample settings (`best_model`)** | **0.5939** | **0.5786** |
+| ... + player countries from player pages | 0.5957 | 0.5789 |
+| **... + `TeamParticipants` lineups (current file)** | **0.5930** | **0.5725** |
+
+Paired on the 7,622 / 11,871 matches both sources have, Liquipedia teams-only equals PandaScore
+(+0.003 ± 0.002 / -0.000 ± 0.002), so the two sources agree on results. Lineups are worth about 0.017 and
+round scores 0.008-0.009 (both measured before `TeamParticipants`). The lineup gain is twice what it was on the
+Valve sample (team-id Elo -> player Elo), plausibly because lower-tier rosters churn and 68% of these matches
+are C-Tier. The Valve-sample settings (players, rd0=200, seed -200, tau=365 d) were not re-tuned for this file.
+
+**By tier, and the missing top-tier lineups.** Until the `TeamParticipants` parser, the whole gain was below
+the top tier: on S/A matches Liquipedia was 0.026-0.034 *worse* than PandaScore. A third of S/A sides (2,004
+of 6,038, nearly all of 2025-26: IEM, PGL, EWC, the Major RMRs) had no lineup, because those pages list
+rosters only in the newer format, so top teams played as synthetic entities beside their own players. S/A
+matches with one synthetic side lost 0.28 per match against PandaScore. Stacked model, Liquipedia minus
+PandaScore (negative = Liquipedia better), tune / confirm, paired by team names within 36 h on 7,373 / 11,557
+matches:
+
+| tier | TeamCard only | + `TeamParticipants` | + subs for `played=false` (current) |
+|---|---|---|---|
+| S/A (n = 795 / 893) | +0.034 ± 0.009 / +0.026 ± 0.008 | +0.020 ± 0.010 / +0.008 ± 0.007 | **+0.007 ± 0.008 / +0.008 ± 0.007** |
+| B (n = 2,852 / 4,697) | -0.009 ± 0.005 / -0.005 ± 0.004 | -0.013 ± 0.005 / -0.015 ± 0.004 | -0.013 ± 0.005 / -0.015 ± 0.004 |
+| C and below (n = 3,726 / 5,967) | -0.016 ± 0.005 / -0.026 ± 0.004 | -0.019 ± 0.005 / -0.029 ± 0.004 | -0.018 ± 0.005 / -0.028 ± 0.004 |
+| all | -0.008 ± 0.003 / -0.014 ± 0.003 | -0.012 ± 0.003 / -0.020 ± 0.003 | **-0.014 ± 0.003 / -0.020 ± 0.003** |
+
+On its own matches the S/A loss fell from 0.645 / 0.652 to 0.619 / 0.632, and the S/A difference to PandaScore
+is now within noise. The other suspects for the gap did not matter (Glicko half replayed through the shipped
+blend, unstacked, vs the same without the change):
+- **Nick collisions.** 86 of the 403 players with 10+ S/A matches appear on two teams on the same day (JACKZ
+  on 13 days), 77 of them players with their own page. Splitting off namesakes (appearances connected by team
+  or 2+ shared teammates; a cluster active at the same time as the main one gets its own id; 2,856 splits)
+  moved S/A by -0.005 / -0.002 and everything else by +0.003: lower-tier players really do turn up on several
+  teams at once (mixes, stand-ins). Tested on the TeamCard-only file; not shipped.
+- **Tier isolation.** Seeding newcomers at the mean of players seen at the event's tier (instead of the
+  region), or at tier mean + region shift, and a learned offset on the difference of the teams' mean tier level
+  (EMA of the tiers each player has played; learned, or fixed at 50 points): every variant within ±0.001 in
+  every tier. The stacker already sees the event tier.
+- **Event lineups, not match lineups.** Still open: a TeamCard is the event roster, so single-match stand-ins
+  are missed (`{{PlayerSubstitutions}}` on 765 pages would be the source).
+
 ## Valve's model as a baseline (`valve_baseline.py`)
 
 Every week Valve's standings are rebuilt with `model/ranking.js` (six-month window, prize and
@@ -445,27 +539,33 @@ roster matches more than one team; the harness uses the intended maximum.
    information: pick/ban order or round scores on PandaScore. Real lineups taken from Valve's standings
    pages were tried and gave nothing once the coverage was made causal (see above). A lineup source
    that does not depend on later rankings (e.g. HLTV match pages) would be a fair retest.
-6. **More data.** One season is thin. The Valve JSON schema is the loader's only dependency, so a
-   scrape/export in the same shape drops in without code changes.
+6. **More data.** Liquipedia gives 53k matches with lineups and round scores: 0.5725 vs 0.6108 on the confirm
+   window, better than PandaScore by 0.014 / 0.020 on shared matches and level with it on S/A-Tier once the
+   `TeamParticipants` rosters are read. Namesake splitting and tier seeds/offsets were negative. Next:
+   match-level stand-ins (`{{PlayerSubstitutions}}`) and re-tuning for a three-year, mostly C-Tier file.
 7. **Ship the blend.** Done, see "Shipped model" below.
 8. **Joint blend weight + temperature.** Done, negative: the shipped 0.3 / online temperature sits on the
    flat optimum.
-9. **Round scores.** Done and shipped on the Valve sample (0.6146 -> 0.6066). Needs a data source with
-   round scores to matter on PandaScore (the paid Historical plan, or a different export).
+9. **Round scores.** Done and shipped on the Valve sample (0.6146 -> 0.6066) and on Liquipedia (0.008-0.009).
 
 ## Shipped model (`rankings.py`)
 
-`rankings.best_model()` is `Stacked(OnlineScale(Blend(BatchBT, RegionalGlicko, w=0.3)))`, i.e. 0.3 batch /
+`rankings.best_model()` is `Stacked(OnlineScale(Blend(BatchBT, LinkedGlicko, w=0.3)))` (`RegionalGlicko` on PandaScore), i.e. 0.3 batch /
 0.7 Glicko on series logits under an online temperature, with the logistic stacking layer on top
 (`best_model(..., stacked=False)` returns the bare blend). Per-dataset settings: on the Valve sample
 Glicko rd0=200, newcomer seed -200, round margins (λ=1); batch tau=365 d, C=3, round margins (λ=2); s=0.25.
-On PandaScore rd0=150, newcomer seed -100, tau=180 d, C=3 and no rounds. The dataset is detected from
-whether the rosters are synthetic `team:` ids. `run_backtest.py` scores the same object as its last entry:
+On PandaScore rd0=150, newcomer seed -100, tau=180 d, C=3 and no rounds. Liquipedia uses the Valve-sample
+settings with `LinkedGlicko` in place of `RegionalGlicko` (identical on files without synthetic players). The
+dataset is detected from whether most rosters are synthetic `team:` ids. `run_backtest.py` scores the same
+object as its last entry:
 
-| | Valve sample (from 2023-03) | PandaScore (from 2025-07) |
-|---|---|---|
-| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 |
-| learned temperature (blend) | 0.70 | 0.72 |
+| | Valve sample (from 2023-03) | PandaScore (from 2025-07) | Liquipedia (from 2025-07) |
+|---|---|---|---|
+| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 | 0.5725 / 0.693 / 0.760 / 0.005 |
+| learned temperature (blend) | 0.70 | 0.72 | 0.68 |
+
+On matches both sources have, the Liquipedia model is better than PandaScore overall and level with it on
+S/A-Tier matches (see the Liquipedia section).
 
 - **Head-to-heads** (`--vs A B --bo N`) run the full model on a synthetic match between the two
   current lineups, so they carry the BO conversion, region effects, temperature and the stacker's
