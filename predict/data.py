@@ -16,6 +16,8 @@ class MapResult:
     name: str
     t1: int
     t2: int
+    # regulation rounds by side, Liquipedia only: {"t1ct", "t1t", "t2ct", "t2t", "first"}; see liquipedia_export.parse_map
+    sides: dict | None = None
 
     @property
     def t1_won(self) -> bool:
@@ -91,7 +93,7 @@ def load_matches(path: Path | str = DEFAULT_DATA, require_full_rosters: bool | N
             continue
         if not p1 or not p2:
             continue
-        maps = [MapResult(x["mapName"], x["team1Score"], x["team2Score"]) for x in m["maps"]]
+        maps = [MapResult(x["mapName"], x["team1Score"], x["team2Score"], x.get("sides")) for x in m["maps"]]
         t1_won = m["winningTeam"] == 1
         winner_maps = sum(1 for mp in maps if mp.t1_won == t1_won)
         best_of = m.get("bestOf") or {1: 1, 2: 3, 3: 5}.get(winner_maps, 2 * winner_maps - 1)

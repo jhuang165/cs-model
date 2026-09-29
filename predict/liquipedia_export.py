@@ -209,6 +209,12 @@ def parse_map(s: str) -> dict | None:
             return None
         name = p.get("map", "").strip()
         s1, s2 = num(p.get("score1")), num(p.get("score2"))
+        # regulation rounds by side: t1ct = rounds team1 won as CT, t2t = rounds team2 won in that same half
+        # (as T); first = team1's starting side. Overtime is the total minus these.
+        halves = [num(p.get(k)) for k in ("t1ct", "t1t", "t2ct", "t2t")]
+        first = p.get("t1firstside", "").strip().lower()
+        sides = ({"t1ct": halves[0], "t1t": halves[1], "t2ct": halves[2], "t2t": halves[3], "first": first}
+                 if all(h is not None for h in halves) and first in ("ct", "t") else None)
         if s1 is None or s2 is None:
             halves = [num(p.get(k)) for k in ("t1t", "t1ct", "t2t", "t2ct")]
             if any(h is None for h in halves):
@@ -225,7 +231,10 @@ def parse_map(s: str) -> dict | None:
                 s2 += (ot[2] or 0) + (ot[3] or 0)
         if s1 == s2:
             return None
-        return {"mapName": name or "unknown", "team1Score": s1, "team2Score": s2}
+        out = {"mapName": name or "unknown", "team1Score": s1, "team2Score": s2}
+        if sides and sides["t1ct"] + sides["t1t"] <= s1 and sides["t2ct"] + sides["t2t"] <= s2:
+            out["sides"] = sides
+        return out
     return None
 
 
@@ -304,8 +313,46 @@ def fetch_pages(client: Client) -> dict[str, str]:
             break
         cont = {"cmcontinue": d["continue"]["cmcontinue"]}
     pages = client.wikitext(titles)
+    pages.update(fetch_subpages(client, pages))
     PAGES.write_text(json.dumps(pages))
     return pages
+
+
+def linked_subpages(title: str, text: str) -> set[str]:
+    """Subpages a tournament page links to, as [[Title/Stage 1]] or relative [[/Stage 1]]."""
+    out = set()
+    for s in re.findall(r"\[\[\s*([^|\]#\n]+)", strip_comments(text)):
+        s = s.strip()
+        if s.startswith("/"):
+            s = title + s.rstrip("/")
+        if s.startswith(title + "/"):
+            out.add(s)
+    return out
+
+
+def fetch_subpages(client: Client, pages: dict[str, str], rounds: int = 3) -> dict[str, str]:
+    """Linked subpages that are not in the category themselves. Majors and many leagues keep their stages and weeks
+    there (the Cologne 2026 Major's page has one match, the final; its Swiss stages are /Stage 1-3), so without them
+    the export misses most of every Major."""
+    found: dict[str, str] = {}
+    todo = set().union(*(linked_subpages(t, x) for t, x in pages.items())) - set(pages)
+    for _ in range(rounds):
+        if not todo:
+            break
+        new = client.wikitext(sorted(todo))
+        found.update(new)
+        todo = set().union(set(), *(linked_subpages(t, x) for t, x in new.items())) - set(pages) - set(found)
+    return found
+
+
+def ancestors(title: str, pages: dict[str, str]) -> list[str]:
+    """Ancestor pages present in `pages`, nearest first (Major/2026/Cologne for Major/2026/Cologne/Stage 1)."""
+    out = []
+    while "/" in title:
+        title = title.rsplit("/", 1)[0]
+        if title in pages:
+            out.append(title)
+    return out
 
 
 TEAM_LINK = re.compile(r"link=([^|\]]+)[|\]]")
@@ -392,9 +439,15 @@ def convert(pages: dict[str, str], team_title: dict[str, str], countries: dict[s
     countries = countries or {}
     st = Counter()
     events, out, seen = {}, [], set()
+    parsed = {t: parse_page(t, x) for t, x in pages.items()}
     for title in sorted(pages):
-        pg = parse_page(title, pages[title])
+        pg = parsed[title]
         info = pg["info"]
+        # a stage subpage rarely repeats the infobox or the team cards: inherit them from its parent page
+        up = [parsed[a] for a in ancestors(title, pages)]
+        if up and not info.get("liquipediatier"):
+            base = next((a["info"] for a in up if a["info"].get("liquipediatier")), up[0]["info"])
+            info = {**base, **{k: v for k, v in info.items() if v}}
         ev_id = title
         events[ev_id] = {
             "eventId": ev_id,
@@ -407,7 +460,7 @@ def convert(pages: dict[str, str], team_title: dict[str, str], countries: dict[s
             "prizeDistribution": [],
         }
         lineup = {}
-        for c in pg["cards"]:
+        for c in pg["cards"] + [c for a in up for c in a["cards"]]:
             if len(c["players"]) == 5:
                 lineup.setdefault(team_title.get(c["team"], c["team"]).lower(), c["players"])
         for m in pg["matches"]:
