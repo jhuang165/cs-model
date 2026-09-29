@@ -429,6 +429,9 @@ A tournament page carries, in wikitext:
 - `{{TeamParticipants}}`: the same in the newer format that most S/A pages use from 2025,
   `{{Opponent|<team>|players={{Persons|{{Person|<nick>|link=|flag=|role=|played=}}...}}}}`. Coaches, staff
   and former players are skipped; a `role=sub` (or `csub=true` coach) fills in for a starter marked `played=false`
+- `{{Substitution|in=|out=|games=}}` inside a match's `{{TeamOpponent|substitutes=}}`: a stand-in for that match.
+  It replaces the `out` player in that match's lineup if it played at least half of the maps (`games=` lists
+  them). 2,436 applied; 166 for too few maps, 209 already in the event lineup, 54 whose `out` player is not in it
 
 Team keys and TeamCard names are resolved to team page titles with `{{Team|key}}` (51 `expandtemplates`
 calls). Result: 53,055 matches (2,811 walkovers dropped), round scores on all but 11 of 108,503 maps, a
@@ -461,7 +464,8 @@ first four Liquipedia rows are before the page countries were added):
 | Liquipedia with lineups, same | 0.5955 | 0.5806 |
 | **Liquipedia with lineups, Valve-sample settings (`best_model`)** | **0.5939** | **0.5786** |
 | ... + player countries from player pages | 0.5957 | 0.5789 |
-| **... + `TeamParticipants` lineups (current file)** | **0.5930** | **0.5725** |
+| ... + `TeamParticipants` lineups | 0.5930 | 0.5725 |
+| **... + per-match stand-ins (current file)** | **0.5921** | **0.5717** |
 
 Paired on the 7,622 / 11,871 matches both sources have, Liquipedia teams-only equals PandaScore
 (+0.003 ± 0.002 / -0.000 ± 0.002), so the two sources agree on results. Lineups are worth about 0.017 and
@@ -496,8 +500,10 @@ blend, unstacked, vs the same without the change):
   region), or at tier mean + region shift, and a learned offset on the difference of the teams' mean tier level
   (EMA of the tiers each player has played; learned, or fixed at 50 points): every variant within ±0.001 in
   every tier. The stacker already sees the event tier.
-- **Event lineups, not match lineups.** Still open: a TeamCard is the event roster, so single-match stand-ins
-  are missed (`{{PlayerSubstitutions}}` on 765 pages would be the source).
+- **Event lineups, not match lineups.** Done: per-match stand-ins (`{{Substitution}}`, 3,099 on 765 pages) are
+  now applied. -0.0008 ± 0.0003 on both windows overall (`--no-stand-ins` vs default, stacked), -0.008 ± 0.005
+  on the 675 / 1,250 matches whose lineup changed, nothing on S/A. A stand-in is public before the match
+  (announced, and in the lobby), and whether one is recorded does not depend on the result.
 
 ## Valve's model as a baseline (`valve_baseline.py`)
 
@@ -539,10 +545,10 @@ roster matches more than one team; the harness uses the intended maximum.
    information: pick/ban order or round scores on PandaScore. Real lineups taken from Valve's standings
    pages were tried and gave nothing once the coverage was made causal (see above). A lineup source
    that does not depend on later rankings (e.g. HLTV match pages) would be a fair retest.
-6. **More data.** Liquipedia gives 53k matches with lineups and round scores: 0.5725 vs 0.6108 on the confirm
-   window, better than PandaScore by 0.014 / 0.020 on shared matches and level with it on S/A-Tier once the
-   `TeamParticipants` rosters are read. Namesake splitting and tier seeds/offsets were negative. Next:
-   match-level stand-ins (`{{PlayerSubstitutions}}`) and re-tuning for a three-year, mostly C-Tier file.
+6. **More data.** Liquipedia gives 53k matches with lineups and round scores: 0.5717 vs 0.6108 on the confirm
+   window, better than PandaScore by 0.015 / 0.021 on shared matches and level with it on S/A-Tier once the
+   `TeamParticipants` rosters are read. Per-match stand-ins add 0.0008. Namesake splitting and tier
+   seeds/offsets were negative. Next: re-tuning for a three-year, mostly C-Tier file.
 7. **Ship the blend.** Done, see "Shipped model" below.
 8. **Joint blend weight + temperature.** Done, negative: the shipped 0.3 / online temperature sits on the
    flat optimum.
@@ -561,7 +567,7 @@ object as its last entry:
 
 | | Valve sample (from 2023-03) | PandaScore (from 2025-07) | Liquipedia (from 2025-07) |
 |---|---|---|---|
-| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 | 0.5725 / 0.693 / 0.760 / 0.005 |
+| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 | 0.5717 / 0.694 / 0.761 / 0.005 |
 | learned temperature (blend) | 0.70 | 0.72 | 0.68 |
 
 On matches both sources have, the Liquipedia model is better than PandaScore overall and level with it on

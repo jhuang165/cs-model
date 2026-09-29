@@ -166,12 +166,40 @@ def parse_time(s: str) -> int | None:
     return int(t.timestamp())
 
 
-def opponent_key(s: str) -> tuple[str | None, str]:
-    """{{TeamOpponent|key|score=..}} -> (key, score)."""
+def opponent_key(s: str) -> tuple[str | None, str, list[dict]]:
+    """{{TeamOpponent|key|score=..|substitutes=..}} -> (key, score, stand-ins)."""
     for body in templates(s, "TeamOpponent"):
         p = params(body)
-        return clean_key(p.get("1") or p.get("template") or "") or None, p.get("score", "")
-    return None, ""
+        return clean_key(p.get("1") or p.get("template") or "") or None, p.get("score", ""), substitutes(p.get("substitutes", ""))
+    return None, "", []
+
+
+def person(s: str) -> dict:
+    """A plain nick, [[link|nick]] or {{OpponentPlayer|nick|flag=|link=}} -> {nick, link, flag}."""
+    for body in templates(s, "OpponentPlayer"):
+        q = params(body)
+        nick = (q.get("1") or "").strip()
+        return {"nick": nick, "link": (q.get("link") or nick).strip(), "flag": (q.get("flag") or "").strip().lower()}
+    m = re.match(r"\s*\[\[([^|\]]+)(?:\|([^\]]+))?\]\]", s)
+    if m:
+        return {"nick": (m.group(2) or m.group(1)).strip(), "link": m.group(1).strip(), "flag": ""}
+    nick = re.sub(r"<[^>]*>|'{2,}", "", s).strip()
+    return {"nick": nick, "link": nick, "flag": ""}
+
+
+def substitutes(s: str) -> list[dict]:
+    """{{PlayerSubstitutions|{{Substitution|in=|out=|games=}}...}}: per-match stand-ins. games= lists the
+    maps the stand-in played ("2", "1 and 2", "2;3"); None means the whole match."""
+    out = []
+    for body in templates(s, "Substitution"):
+        q = params(body)
+        pin, pout = person(q.get("in", "")), person(q.get("out", ""))
+        if q.get("link"):
+            pin["link"] = q["link"].strip()
+        if pin["nick"] and pout["nick"]:
+            games = {int(x) for x in re.findall(r"\d+", q.get("games", ""))} or None
+            out.append({"in": pin, "out": pout, "games": games})
+    return out
 
 
 def parse_map(s: str) -> dict | None:
@@ -251,8 +279,8 @@ def parse_page(title: str, text: str) -> dict:
     matches = []
     for body in templates(text, "Match"):
         p = params(body)
-        k1, sc1 = opponent_key(p.get("opponent1", ""))
-        k2, sc2 = opponent_key(p.get("opponent2", ""))
+        k1, sc1, subs1 = opponent_key(p.get("opponent1", ""))
+        k2, sc2, subs2 = opponent_key(p.get("opponent2", ""))
         if not k1 or not k2 or k1 == "tbd" or k2 == "tbd":
             continue
         maps = [m for i in range(1, 10) if (m := parse_map(p.get(f"map{i}", "")))]
@@ -260,7 +288,7 @@ def parse_page(title: str, text: str) -> dict:
         matches.append({
             "t1": k1, "t2": k2, "time": parse_time(p.get("date", "")), "maps": maps,
             "bestof": num(p.get("bestof")), "hltv": p.get("hltv", "").strip() or None, "walkover": bool(walkover),
-            "winner": p.get("winner", "").strip(),
+            "winner": p.get("winner", "").strip(), "subs1": subs1, "subs2": subs2,
         })
     return {"title": title, "info": info, "cards": cards, "matches": matches}
 
@@ -360,7 +388,7 @@ def player_id(pl: dict) -> str:
 
 
 def convert(pages: dict[str, str], team_title: dict[str, str], countries: dict[str, str] | None = None,
-            lineups: bool = True) -> tuple[dict, Counter]:
+            lineups: bool = True, stand_ins: bool = True) -> tuple[dict, Counter]:
     countries = countries or {}
     st = Counter()
     events, out, seen = {}, [], set()
@@ -402,15 +430,31 @@ def convert(pages: dict[str, str], team_title: dict[str, str], countries: dict[s
                 continue
             seen.add(key)
 
-            def side(team):
+            def side(team, subs):
                 pl = lineup.get(team.lower()) if lineups else None
                 if pl is None:
                     return [{"playerId": f"team:{team.lower()}", "nick": team, "country": "", "countryIso": "world", "steamIds": []}]
+                pl = list(pl)
+                for s in subs if stand_ins else ():
+                    # one lineup per match: a stand-in counts if they played at least half of its maps
+                    if s["games"] is not None and 2 * len(s["games"] & set(range(1, len(m["maps"]) + 1))) < len(m["maps"]):
+                        st["stand_in_partial"] += 1
+                        continue
+                    if any(x["link"].lower() == s["in"]["link"].lower() for x in pl):
+                        st["stand_in_listed"] += 1      # the event lineup already has the stand-in
+                        continue
+                    out = {s["out"]["nick"].lower(), s["out"]["link"].lower()}
+                    i = next((i for i, x in enumerate(pl) if x["nick"].lower() in out or x["link"].lower() in out), None)
+                    if i is None:
+                        st["stand_in_unmatched"] += 1
+                        continue
+                    pl[i] = s["in"]
+                    st["stand_in"] += 1
                 return [{"playerId": player_id(x), "nick": x["nick"], "country": countries.get(x["link"].lower(), ""),
                          "countryIso": x["flag"] or country_iso(countries.get(x["link"].lower(), "")) or "world",
                          "steamIds": []} for x in pl]
 
-            p1, p2 = side(t1), side(t2)
+            p1, p2 = side(t1, m["subs1"]), side(t2, m["subs2"])
             real = [not p[0]["playerId"].startswith("team:") for p in (p1, p2)]
             st["sides_real"] += sum(real)
             st["both_real"] += all(real)
@@ -431,6 +475,7 @@ def main():
     ap.add_argument("--contact", help="contact for the User-Agent (default: git user.email)")
     ap.add_argument("--out", default=str(OUT))
     ap.add_argument("--no-lineups", action="store_true", help="synthetic team players only (lineup-blind baseline)")
+    ap.add_argument("--no-stand-ins", action="store_true", help="event lineups only, ignore per-match substitutes")
     args = ap.parse_args()
     LP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -442,16 +487,21 @@ def main():
         keys |= {c["team"] for c in pg["cards"]} | {k for m in pg["matches"] for k in (m["t1"], m["t2"])}
     team_title = resolve_teams(client, keys) if args.fetch else json.loads(TEAMS.read_text())
     if args.fetch:
-        links = {x["link"] for text in pages.values() for c in parse_page("", text)["cards"] for x in c["players"]}
+        links = set()
+        for text in pages.values():
+            pg = parse_page("", text)
+            links |= {x["link"] for c in pg["cards"] for x in c["players"]}
+            links |= {s["in"]["link"] for m in pg["matches"] for s in m["subs1"] + m["subs2"]}
         countries = fetch_player_countries(client, links)
     else:
         countries = json.loads(COUNTRIES.read_text()) if COUNTRIES.exists() else {}
-    data, st = convert(pages, team_title, countries, lineups=not args.no_lineups)
+    data, st = convert(pages, team_title, countries, lineups=not args.no_lineups, stand_ins=not args.no_stand_ins)
     Path(args.out).write_text(json.dumps(data, separators=(",", ":")))
     print(f"{len(pages)} pages, {st['parsed']} match templates -> {st['kept']} matches "
           f"(walkover {st['walkover']}, no time/maps {st['no_time_or_maps']}, unfinished {st['unfinished']}, "
           f"duplicate {st['duplicate']}); sides with lineups {st['sides_real']} of {2 * st['kept']}, "
-          f"both {st['both_real']}")
+          f"both {st['both_real']}; stand-ins applied {st['stand_in']} (partial {st['stand_in_partial']}, already in the lineup {st['stand_in_listed']}, "
+          f"out-player not in lineup {st['stand_in_unmatched']})")
     print(f"wrote {args.out} ({client.requests} API requests this run)")
 
 
