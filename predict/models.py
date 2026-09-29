@@ -51,7 +51,64 @@ def series_prob_seq(probs: list[float], best_of: int) -> float:
     return f(0, 0, 0)
 
 
+def series_prob_pick(p_map: float, best_of: int, delta: float = 0.0) -> float:
+    """P(win a best-of-N) when maps are not identical draws: each team picks maps it is stronger on, so a
+    picked map is worth +delta map logits to its picker and the decider is even. BO3 = [pick, pick, decider],
+    BO5 = two picks each then the decider; BO1 is a decider. delta=0 is series_prob. The veto order is unknown
+    before the match, but in a BO3 the result does not depend on which pick is played first."""
+    if not delta or best_of not in (3, 5):
+        return series_prob(p_map, best_of)
+    p = min(1 - 1e-9, max(1e-9, p_map))
+    z = math.log(p / (1 - p))
+    up, dn = 1 / (1 + math.exp(-(z + delta))), 1 / (1 + math.exp(-(z - delta)))
+    return series_prob_seq([up, dn, p] if best_of == 3 else [up, dn, up, dn, p], best_of)
+
+
 UNKNOWN_MAPS = {"de_default", ""}
+
+
+class SideRates:
+    """Per-map CT-side round win rate from past maps only, exponentially decayed (half-life in days) because
+    the balance moves with patches (overall CT share went from 49% in 2024 to 52% in 2026). bias() is the
+    CT side's round logit, shrunk toward even by `prior` pseudo-rounds."""
+
+    def __init__(self, half_life_days: float = 180.0, prior: float = 500.0):
+        self.hl, self.prior = half_life_days * 86400.0, prior
+        self.ct = defaultdict(float)
+        self.n = defaultdict(float)
+        self.t = {}
+
+    def bias(self, map_name: str) -> float:
+        c, n = self.ct[map_name], self.n[map_name]
+        rate = (c + 0.5 * self.prior) / (n + self.prior)
+        return math.log(rate / (1 - rate))
+
+    def add(self, map_name: str, t: float, ct_rounds: float, rounds: float):
+        if map_name in self.t:
+            k = 0.5 ** ((t - self.t[map_name]) / self.hl)
+            self.ct[map_name] *= k
+            self.n[map_name] *= k
+        self.t[map_name] = t
+        self.ct[map_name] += ct_rounds
+        self.n[map_name] += rounds
+
+    def update(self, m: Match):
+        for mp in m.maps:
+            s = mp.sides
+            if s and mp.name not in UNKNOWN_MAPS:
+                ct = s["t1ct"] + s["t2ct"]
+                self.add(mp.name, m.time, ct, ct + s["t1t"] + s["t2t"])
+
+
+def round_blocks(mp, by_side: bool = True):
+    """A map's rounds as [(team1 rounds, team2 rounds, side)] where side is +1 for the regulation half team1
+    played as CT, -1 for its T half and 0 for overtime or when the split is unknown."""
+    s = mp.sides if by_side else None
+    if not s:
+        return [(mp.t1, mp.t2, 0)]
+    blocks = [(s["t1ct"], s["t2t"], 1), (s["t1t"], s["t2ct"], -1),
+              (mp.t1 - s["t1ct"] - s["t1t"], mp.t2 - s["t2ct"] - s["t2t"], 0)]
+    return [b for b in blocks if b[0] + b[1] > 0]
 
 
 class Model:
@@ -173,6 +230,8 @@ class PlayerGlicko(Model):
     players move slowly, which matters in a dataset with ~950 teams and heavy churn at the bottom.
     """
 
+    pick_delta = 0.0   # series conversion, see series_prob_pick
+
     def __init__(self, start: float = 1500.0, start_rd: float = 350.0, min_rd: float = 30.0,
                  c: float = 34.6, per_map: bool = True):
         self.start, self.start_rd, self.min_rd, self.c = start, start_rd, min_rd, c
@@ -207,7 +266,7 @@ class PlayerGlicko(Model):
 
     def predict(self, m):
         p = self._p_map(m)
-        return series_prob(p, m.best_of) if self.per_map else p
+        return series_prob_pick(p, m.best_of, self.pick_delta) if self.per_map else p
 
     def predict_map(self, m, map_name):
         """Per-map win probability; the base model ignores the map name."""
@@ -363,8 +422,12 @@ class RegionalGlicko(PlayerGlicko):
     def __init__(self, seed: bool = True, offset: bool = True, seed_rd: float = float("inf"),
                  offset_lr: float = 2.0, start_rd: float = 150.0, c: float = 20.0, min_rd: float = 30.0,
                  round_weight: float = 0.0, round_scale: float = 0.25, seed_offset: float = 0.0,
-                 exp_lr: float = 0.0, exp_beta: float = 0.0, exp_maps: float = 0.0, **kw):
+                 exp_lr: float = 0.0, exp_beta: float = 0.0, exp_maps: float = 0.0,
+                 side_rates: SideRates | None = None, **kw):
         super().__init__(start_rd=start_rd, c=c, min_rd=min_rd, **kw)
+        # side_rates: split each map's round likelihood by CT/T half with the map's CT bias (Liquipedia only).
+        # The table is updated here after the match; share one instance with BatchBT only if it does not update it.
+        self.side_rates = side_rates
         # experience term (off by default, not shipped; see README): team strength gets exp_beta rating points
         # times the players' mean experience, log1p(maps played) or, with exp_maps > 0, 1 - exp(-maps / exp_maps).
         # exp_lr > 0 learns exp_beta online like the region offset. rankings.display_rating ignores it.
@@ -387,6 +450,8 @@ class RegionalGlicko(PlayerGlicko):
             self.name += f"+rounds({round_weight:g}x{round_scale:g})"
         if exp_lr or exp_beta:
             self.name += f"+exp(b0={exp_beta:g},lr={exp_lr:g},maps={exp_maps:g})"
+        if side_rates is not None:
+            self.name += "+sides"
 
     def region_mean(self, region):
         vals = [self.r[p] for p in self.members[region] if self.rd[p] <= self.seed_rd]
@@ -443,13 +508,19 @@ class RegionalGlicko(PlayerGlicko):
             self._update_side(m.team1_players, r2, rd2, s, self.g(rd2) * off)
             self._update_side(m.team2_players, r1, rd1, 1.0 - s, -self.g(rd1) * off)
             if self.round_weight and mp and mp.valid_for_margin:
-                r1, rd1 = self.team(m.team1_players)
-                r2, rd2 = self.team(m.team2_players)
-                n, share = self.round_weight * (mp.t1 + mp.t2), mp.t1_round_share
-                self._update_side(m.team1_players, r2, rd2, share, self.g(rd2) * off, self.round_scale, n)
-                self._update_side(m.team2_players, r1, rd1, 1.0 - share, -self.g(rd1) * off, self.round_scale, n)
+                # with side_rates, each regulation half is its own block whose expectation includes the map's
+                # CT bias (a 13-3 that started on CT on Train is less than the same score on Anubis)
+                for a, b, side in round_blocks(mp, self.side_rates is not None):
+                    r1, rd1 = self.team(m.team1_players)
+                    r2, rd2 = self.team(m.team2_players)
+                    sb = side * self.side_rates.bias(mp.name) / (Q * self.round_scale) if side else 0.0
+                    n, share = self.round_weight * (a + b), a / (a + b)
+                    self._update_side(m.team1_players, r2, rd2, share, self.g(rd2) * off + sb, self.round_scale, n)
+                    self._update_side(m.team2_players, r1, rd1, 1.0 - share, -self.g(rd1) * off - sb, self.round_scale, n)
         for p in m.team1_players + m.team2_players:
             self.nmaps[p] += len(maps)
+        if self.side_rates is not None:
+            self.side_rates.update(m)
 
 
 class Blend(Model):

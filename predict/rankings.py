@@ -31,18 +31,21 @@ def synthetic_rosters(matches) -> bool:
     return sum(m.team1_players[0].startswith("team:") for m in matches) > len(matches) / 2
 
 
-def best_model(synthetic: bool, stacked: bool = True):
+def best_model(synthetic: bool, stacked: bool = True, glicko_kw: dict | None = None, batch_kw: dict | None = None):
+    """glicko_kw / batch_kw override the per-dataset settings below (experiments, see compare.py)."""
     # Tuned per dataset (see README): entities are players on the Valve sample and teams on
     # PandaScore, which moves the batch fit's best half-life and ridge strength. Newcomers are
     # seeded below their region's mean (seed_offset): unknown lineups lose more than average.
     if synthetic:
-        glicko, batch = RegionalGlicko(start_rd=150, c=20, seed_offset=-100), BatchBT(tau_days=180, C=3)
+        glicko = RegionalGlicko(**{"start_rd": 150, "c": 20, "seed_offset": -100, **(glicko_kw or {})})
+        batch = BatchBT(**{"tau_days": 180, "C": 3, **(batch_kw or {})})
     else:
         # real lineups and round scores (Valve sample, Liquipedia): both halves also learn from round
         # margins. LinkedGlicko carries ratings across Liquipedia sides that fall back to a synthetic
         # team player; on files without synthetic players it is plain RegionalGlicko.
-        glicko = LinkedGlicko(start_rd=200, c=20, round_weight=1.0, round_scale=0.25, seed_offset=-200)
-        batch = BatchBT(tau_days=365, C=3, round_weight=2.0, round_scale=0.25)
+        glicko = LinkedGlicko(**{"start_rd": 200, "c": 20, "round_weight": 1.0, "round_scale": 0.25, "seed_offset": -200,
+                                 **(glicko_kw or {})})
+        batch = BatchBT(**{"tau_days": 365, "C": 3, "round_weight": 2.0, "round_scale": 0.25, **(batch_kw or {})})
     blend = OnlineScale(Blend(batch, glicko, w=BATCH_WEIGHT))
     return (Stacked(blend, glicko, batch) if stacked else blend), glicko, batch
 
@@ -76,7 +79,7 @@ def display_rating(model, glicko, batch, players, region):
     rg += glicko.o[region]
     rb = batch.rating(players)
     if batch.region and region in batch.ridx:
-        n_ent = len(batch.theta) - len(batch.ridx)
+        n_ent = batch.n_ent_fit()
         rb += ELO_PER_LOGIT * batch._theta(n_ent + batch.ridx[region])
     return 1500 + model.a * (BATCH_WEIGHT * (rb - 1500) + (1 - BATCH_WEIGHT) * (rg - 1500)), rd
 

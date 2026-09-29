@@ -24,6 +24,7 @@ from .models import Model
 DAY = 86400
 NAMES = (["z_shipped", "z_batch", "z_glicko", "rd1", "rd2", "z_x_rd", "bo1", "bo3", "bo5", "logprize", "lan"]
          + [f"t{i}_{k}" for i in (1, 2) for k in ("rest", "logn", "plogn", "form", "nrec")])
+REGIONS = ("EU", "CIS", "NA", "SA", "AS", "OC", "MENA")   # region_feats: team1's region dummy minus team2's
 
 
 def _logit(p):
@@ -33,8 +34,11 @@ def _logit(p):
 
 class Stacked(Model):
     def __init__(self, inner: Model, glicko, batch, refit_days: float = 30.0, min_rows: int = 1000,
-                 C: float = 1.0, burn_in_days: float = 60.0):
+                 C: float = 1.0, burn_in_days: float = 60.0, region_feats: bool = False):
         self.inner, self.glicko, self.batch = inner, glicko, batch
+        # region_feats: a learned intercept per region in cross-region matches, for when the ratings' own region
+        # offsets lag (CIS vs EU online, see README "The 2026Q3 drop")
+        self.region_feats = region_feats
         self.refit, self.min_rows, self.C, self.burn_in = refit_days * DAY, min_rows, C, burn_in_days * DAY
         self.X: list[list[float]] = []
         self.y: list[float] = []
@@ -67,6 +71,9 @@ class Stacked(Model):
         f += [1.0 if m.best_of == b else 0.0 for b in (1, 3, 5)]
         f += [math.log1p(m.prize_pool) / 10, 1.0 if m.lan else 0.0]
         f += self._team(m.team1_id, m.team1_players, m.time) + self._team(m.team2_id, m.team2_players, m.time)
+        if self.region_feats:
+            r1, r2 = m.team1_region, m.team2_region
+            f += [float(r1 == r) - float(r2 == r) for r in REGIONS]
         self._cache = (m, f, p)
         return f, p
 
@@ -106,7 +113,8 @@ class Stacked(Model):
                 self.pn[pl] += 1
 
     def coefficients(self):
-        return {} if self.coef is None else dict(zip(NAMES, self.coef[2]))
+        names = NAMES + [f"reg_{r}" for r in REGIONS] if self.region_feats else NAMES
+        return {} if self.coef is None else dict(zip(names, self.coef[2]))
 
 
 def main():

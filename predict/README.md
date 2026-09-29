@@ -34,6 +34,12 @@ python3 -m venv .venv && .venv/bin/pip install numpy pandas scikit-learn scipy m
 | `live_rosters.py` | attaches real lineups from Valve's standings detail pages to the PandaScore export (`--causal` for leak-free coverage); not shipped |
 | `liquipedia.py` | polite, disk-cached client for Liquipedia's MediaWiki API (rate limit, User-Agent with contact, gzip) |
 | `liquipedia_export.py` | builds `data/matchdata_liquipedia.json` from Liquipedia's CS2 tournament pages: lineups (TeamCard and TeamParticipants), round scores, map names, LAN, tier |
+| `compare.py` | paired walk-forward comparison of named variants on one file; caches predictions in `data/compare/`, reports tune/confirm log loss with paired SEs |
+| `map_persistence.py` / `map_edge.py` | does a team's map-specific edge persist; team map offsets and map-pool share priced with the maps known |
+| `whr.py` | Whole-History Rating (Coulom) on players with round margins and the regional newcomer prior; reference, not shipped |
+| `inplay.py` | in-play map and series prices from the score and sides, consistent with the pre-map price; `--validate` backtests it at halftime |
+| `upcoming.py` | fetches ongoing/upcoming tournament pages and prices every scheduled match with the shipped model |
+| `market.py` | historical prediction-market prices joined to the model's predictions (model vs market) |
 
 Every runner takes `--data <file>` to point at a different Valve-schema file.
 
@@ -441,6 +447,14 @@ flags where given, otherwise from the lead section of the player's own page (`{{
 fetched 50 at a time with `rvsection=0`); 94% of player slots get one. Fetching the page countries on top of
 the flags changed the log loss by less than 0.002.
 
+**Subpages.** Majors and many leagues keep their stages and weeks on subpages that are not in the category
+themselves (`IEM Cologne Major 2026` has one match, the final; its Swiss stages are `/Stage 1-3`). The export now
+also fetches every subpage a tournament page links to, `[[Title/...]]` or relative `[[/...]]` (403, then their own
+subpages; 19 requests), and a subpage without its own infobox or team cards inherits its ancestors'. The file grows
+from 53,055 to 62,787 matches: the Austin, Budapest and Cologne Majors, PGL and Perfect World stages, and many league
+weeks. On the matches both files have, the shipped model improves by 0.0030 ± 0.0007 (tune) and 0.0013 ± 0.0005
+(confirm), in every quarter. The whole-file scores rise (0.5940 / 0.5737) because the added matches are harder.
+
 **Is lineup coverage leak-free?** Unlike Valve's standings pages, a TeamCard is written for every
 participant of an event, whatever the team goes on to do. Two checks agree:
 - The lineup gain sits in matches where *both* sides have lineups, not where one does (the leak's signature
@@ -505,6 +519,141 @@ blend, unstacked, vs the same without the change):
   on the 675 / 1,250 matches whose lineup changed, nothing on S/A. A stand-in is public before the match
   (announced, and in the lobby), and whether one is recorded does not depend on the result.
 
+## Round 3: sides, map pools, series conversion, WHR, drift, in-play, upcoming (Liquipedia, Sep 2026)
+
+Everything here is on `data/matchdata_liquipedia_sides.json`, the Liquipedia export with per-match stand-ins and
+the CT/T half split kept on every map (`MapResult.sides`), scored by `compare.py`: tune Jul 2024 - Jun 2025
+(n=17,002), confirm from Jul 2025 (n=23,459), paired differences ± SE. The shipped stacked model scores
+0.5921 / 0.5718 on it. These runs predate the subpage fix below, so the file had 53k matches; the market and 2026Q3
+sections use the 62.8k-match file.
+
+**CT/T side split in the round likelihood (negative).** Liquipedia gives every map's rounds by half and side
+(107.7k of 108.5k maps). CT bias is real and moves with patches: the CT share of rounds is 44% on Anubis, 55% on
+Train and Overpass, and overall 49% in 2024 and 52% in 2026. `RegionalGlicko(side_rates=SideRates())` splits
+each map's round update into the half team1 played as CT, the half it played as T, and overtime, each with the
+map's decayed CT round logit in the expectation; `BatchBT(sides=True)` does the same with one fitted CT column
+per map (it recovers the empirical biases: Anubis -0.21, Nuke +0.10, Overpass +0.15). Stacked result: +0.0000 ±
+0.0001 on both windows. Glicko's map prices move by 0.4 points on average: over a whole map both teams play both
+sides, so the bias only matters for the few rounds of imbalance in a lopsided map. Code kept, off by default.
+
+**Map pool: team edges exist, and pool share prices them (post-veto only).** `map_persistence.py` redoes the
+per-map persistence check at team level over three years. Unlike the one-year Valve sample (0.00), a (team, map)
+residual in the first half of its history correlates with the second half: 0.10 (pairs with 16+ maps, n=2,997)
+and 0.17 (32+ maps, n=1,614) after removing the team's overall residual. In consecutive 90-day windows it is
+0.03, so this is a stable pool preference, not form. `map_edge.py` prices it at map level with the maps known,
+walk-forward, as an online logistic layer over the Glicko map logit (per map, n=34,563 / 49,604):
+
+| per-map features | tune | confirm |
+|---|---|---|
+| Glicko map logit | 0.6337 | 0.6221 |
+| + team map offsets (Elo-style, k=0.1, shrink 0.01) | -0.0005 ± 0.0001 | -0.0008 ± 0.0001 |
+| + map-pool share: log share of the team's last 40 maps on this map, team1 minus team2 | -0.0013 ± 0.0003 | -0.0019 ± 0.0003 |
+| + both | -0.0016 ± 0.0003 | -0.0023 ± 0.0003 |
+
+Teams win more on the maps they play most (they pick them). This needs the veto, so it is a post-veto price, not
+a pre-match feature; it is not in the shipped model.
+
+**Pick-aware series conversion (negative).** `models.series_prob_pick` prices a BO3 as [pick +δ, pick -δ, decider]
+instead of three identical maps. δ=0.4: -0.0001 on the bare blend, 0.0000 stacked. The online temperature and
+the stacker's best-of terms already absorb the heterogeneity.
+
+**Whole-History Rating (`whr.py`, reference).** A random-walk Bradley-Terry on players with the same round margins,
+region entity and newcomer prior, refit incrementally by Newton steps. Alone it equals the Glicko half (+0.0003 ±
+0.0012 / +0.0008 ± 0.0011). In place of Glicko in the blend it is worse (+0.0013 / +0.0017): WHR and the batch fit
+are both joint smoothers and the blend loses its diversity. In place of the batch half it improves the bare blend
+(-0.0007 ± 0.0005 / -0.0008 ± 0.0004), but stacked it is level (+0.0007 / +0.0001), at a fraction of the runtime
+(109 s vs ~20 min for the daily batch refits on this file). See its docstring for the tuning.
+
+**Rating drift for young players (negative, not built).** With the -200 newcomer seed, the Glicko half's map
+residuals are flat in the lineup's mean experience: every bucket from 0 to 700+ maps played is within about 2 SE of
+zero, and there is no upward trend for young lineups. There is nothing for a drift term to fit.
+
+**In-play prices (`inplay.py`).** Each round is a Bernoulli trial at logit rho ± (map CT bias) by side, with rho
+solved so the 0-0 price equals the pre-map price; a DP over the score (MR12, MR3 overtime repeated at 3-3) gives
+the map price at any state, and `price_series` rolls map prices into a series price. Rounds are not independent,
+so the raw DP overprices leads; a walk-forward correction at the 107k halftime states, logit P = 0.71 logit(DP) +
+0.08 logit(pre-map), fixes it (`price_map_calibrated`):
+
+| price at the half | tune | confirm |
+|---|---|---|
+| pre-map price (ignores the score) | 0.6343 | 0.6222 |
+| round DP | 0.4492 | 0.4459 |
+| round DP + correction | **0.4404** | **0.4360** |
+
+By halftime margin (from Jul 2024): +4 is won 82.9%, the DP says 87.8%, corrected 82.4%; -6 is won 10.7%, DP 5.3%,
+corrected 9.8%. The correction is fitted at the half only, so other states are an extrapolation.
+
+**Upcoming matches (`upcoming.py`).** Fetches the category listing and the pages of every tournament overlapping
+[now - 2 days, now + N days] into `data/liquipedia/live/<UTC hour>/` (about 11 API requests), adds the results on
+those pages that the data file does not have yet (331 on the first run), and prices every scheduled match with
+known opponents using the event lineups (with announced stand-ins), else the team's latest lineup. Best-of
+defaults to 3 when the match does not say.
+
+## Model vs the market (`market.py`)
+
+The real bar for a pricing model is the market's price. `market.py` pulls every resolved CS2 series-winner market
+from Polymarket (public Gamma and CLOB price-history APIs; 10,947 markets, Sep 2024 - Sep 2026) and Kalshi (public
+market data; 6,107, Nov 2025 - Sep 2026), no keys, cached in `data/market/` and never re-requested. The price is the
+Polymarket displayed price / Kalshi bid-ask midpoint 60 minutes before the earlier of the market's scheduled
+start and Liquipedia's match time; markets whose price never moved by more than 0.01 before the start (unquoted)
+are dropped. The market's log loss is flat from -60 to 0 minutes and drops only after the start (0.589 at 0,
+0.555 at +30, 0.468 at +60), so the pre-match price is not in-play. Team names are joined to Liquipedia within
+±36 h (83% of Polymarket and 78% of Kalshi markets) and scored against the shipped model's walk-forward predictions
+(`compare.py base`, on the 62.8k-match file with subpages).
+Nearly all matched rows are in the confirm window.
+
+| log loss, model minus market ± paired SE | n | market | model | difference |
+|---|---|---|---|---|
+| Polymarket, all | 8,037 | 0.5918 | 0.5899 | -0.0019 ± 0.0028 |
+| Polymarket, lifetime volume ≥ $10k | 4,666 | 0.6177 | 0.6295 | +0.0117 ± 0.0033 |
+| Polymarket, S-Tier | 979 | 0.5946 | 0.6100 | +0.0154 ± 0.0060 |
+| Polymarket, B-Tier | 3,283 | 0.6036 | 0.5951 | -0.0085 ± 0.0040 |
+| Kalshi, all | 4,482 | 0.5939 | 0.5973 | +0.0034 ± 0.0037 |
+| Kalshi, volume ≥ 10k | 3,579 | 0.6276 | 0.6402 | +0.0127 ± 0.0039 |
+| priced by both markets | 4,138 | Poly 0.5892, Kalshi 0.5896 | 0.5964 | |
+
+- **Level overall, behind where the market is liquid.** The model beats thin markets (volume under $10k: -0.022)
+  and early Polymarket (2025Q4: -0.033), and loses by 0.011-0.015 on liquid and S-Tier markets.
+- **Little information beyond the market.** In-sample the model carries real weight (about 0.5 on z_model beside
+  0.6 on z_market; about 0.25 on liquid markets), but out of sample (fit on the first half, test on the second) the
+  combination beats the market by 0.001-0.004 ± 0.003. An expanding monthly refit gains 0.010 ± 0.002 on all
+  Polymarket markets, 0.006 on Kalshi, and nothing on liquid ones (0.000 ± 0.001).
+- **No edge after costs.** Betting the model's side when it disagrees by more than a threshold looks profitable at
+  the midpoint (+8% to +30%), but that is mostly thin, unfillable quotes. Filled at Kalshi's recorded ask plus its
+  fee (0.07 q(1-q)) the ROI is -2% to +2.5% at every threshold, every bootstrap CI spanning zero.
+- **The model got worse in 2026Q3** while the market did not; see next section.
+
+`.venv/bin/python -m predict.market` fetches only what is not cached (`--offline` for none, `--relist` for newly
+resolved markets; `--offset`, `--liquid`, `--half-spread`, `--spot`).
+
+## The 2026Q3 drop
+
+On the 53k-match file the shipped model scored 0.580 in 2026Q3 against 0.567-0.569 in the three quarters before,
+and it lost to the market that quarter (Polymarket +0.015, Kalshi +0.011, on the fixed file) after beating or matching
+it in 2026Q1-Q2 (-0.001 to -0.007). Two causes, one fixed:
+
+1. **Missing matches (fixed).** S-Tier matches dropped to one a month in June 2025, December 2025 and June 2026: the
+   three Majors, whose stages live on subpages the export never fetched. Top teams went into July 2026 with their
+   Cologne results missing. The subpage crawl (Liquipedia section) fixes it and improves 2026Q3 by 0.0018 ± 0.0011 on
+   the same matches, and every other quarter by 0.0004-0.0042.
+2. **CIS vs EU online (explained, not fixed).** Measured as excess loss (log loss minus the entropy of the model's
+   own prices, i.e. being wrong more often than it expects), 2026Q3 is still +0.016 ± 0.006 on the fixed file,
+   against -0.006 to +0.009 in the other eight quarters. A single temperature does not fix it (in-quarter
+   recalibration recovers 0.001). It is not roster churn (the excess is in unchanged lineups, +0.019, not changed
+   ones) and not newcomers. It sits in cross-region matches, +0.041 ± 0.011 (same-region +0.003), and there in
+   online CIS-vs-EU matches: CIS teams won 4.6 ± 1.4 points more often than priced (n=1,121), up from 2.0 points
+   over the year before. Two fixes, stacked, vs the shipped model:
+
+   | | tune | confirm | 2026Q3 CIS-EU |
+   |---|---|---|---|
+   | Glicko region offset learning rate 2 -> 6 | +0.0004 ± 0.0002 | +0.0006 ± 0.0002 | +0.0004 ± 0.0013 |
+   | stacker region dummies (`Stacked(region_feats=True)`) | +0.0000 ± 0.0003 | -0.0002 ± 0.0002 | -0.0039 ± 0.0014 |
+
+   The dummies help where they should but recover a tenth of the excess: the stacker refits on all history and the
+   bias moved within the quarter. Kept off by default. It may partly be noise (2.6 SE, the worst of nine quarters),
+   but the market priced those matches better, so the information existed: likely CIS lineups improving faster
+   than the ratings follow, or CIS players' region assignment (mixed-nationality CIS rosters in EU leagues).
+
 ## Valve's model as a baseline (`valve_baseline.py`)
 
 Every week Valve's standings are rebuilt with `model/ranking.js` (six-month window, prize and
@@ -533,8 +682,9 @@ roster matches more than one team; the harness uses the intended maximum.
 2. **Stale rosters in `rankings.py`.** Done: a team is listed only if a majority of its latest
    lineup last played for it (Outsiders -> Virtus.pro now shows once), and `--active-days`
    (default 180) hides teams that have stopped playing.
-3. **Map pool.** Tried, see above. Would need pick/ban data (which team picked which map) to
-   get more than the ~0.002 map-level gain.
+3. **Map pool.** Tried twice. Per-player map offsets were nil on the Valve sample; at team level over three years
+   of Liquipedia, map-pool share is worth 0.002 per map once the maps are known (round 3). Next: a post-veto price
+   in `rankings.py --vs --maps`, and pick/ban order if a source for it appears.
 4. **Tuning.** Done, see above; flat surface, little to gain.
 5. **Stacking.** Done and shipped (`stacked.py`, 0.003 on both datasets, then 0.001 more from the
    `z_x_rd` uncertainty interaction). Its RD coefficients led to the newcomer seed offset (also shipped,
@@ -553,6 +703,12 @@ roster matches more than one team; the harness uses the intended maximum.
 8. **Joint blend weight + temperature.** Done, negative: the shipped 0.3 / online temperature sits on the
    flat optimum.
 9. **Round scores.** Done and shipped on the Valve sample (0.6146 -> 0.6066) and on Liquipedia (0.008-0.009).
+   Splitting them by CT/T side adds nothing (round 3).
+12. **The market.** On liquid and S-Tier markets the model is 0.012-0.019 behind the market and has no edge after
+   costs (see "Model vs the market"). Next: find why 2026Q3 is worse, and consider the market price as a stacker
+   feature where it exists.
+11. **Round 3** (see above): side split, pick-aware series conversion, WHR and young-player drift are negative or
+   level; map-pool share works post-veto; in-play and upcoming-match pricing are built.
 
 ## Shipped model (`rankings.py`)
 
@@ -567,10 +723,11 @@ object as its last entry:
 
 | | Valve sample (from 2023-03) | PandaScore (from 2025-07) | Liquipedia (from 2025-07) |
 |---|---|---|---|
-| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 | 0.5717 / 0.694 / 0.761 / 0.005 |
+| log loss / acc / auc / ece | 0.5976 / 0.674 / 0.731 / 0.017 | 0.6108 / 0.659 / 0.717 / 0.007 | 0.5737 / 0.694 / 0.759 / 0.007 |
 | learned temperature (blend) | 0.70 | 0.72 | 0.68 |
 
-On matches both sources have, the Liquipedia model is better than PandaScore overall and level with it on
+The Liquipedia column is the 62.8k-match file with subpages (0.5717 on the old 53k-match file; on the same matches
+the new one is 0.0013 better). On matches both sources have, the Liquipedia model is better than PandaScore overall and level with it on
 S/A-Tier matches (see the Liquipedia section).
 
 - **Head-to-heads** (`--vs A B --bo N`) run the full model on a synthetic match between the two

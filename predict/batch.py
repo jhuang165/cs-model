@@ -28,7 +28,7 @@ from sklearn.linear_model import LogisticRegression
 
 from .data import DEFAULT_DATA, Match, load_matches
 from .evaluate import calibration, summarize, walk_forward
-from .models import Model, OnlineScale, series_prob
+from .models import Model, OnlineScale, round_blocks, series_prob_pick
 from .regions import country_region
 
 DAY = 86400.0
@@ -36,22 +36,30 @@ ELO_PER_LOGIT = 400.0 / math.log(10)
 
 
 class BatchBT(Model):
+    pick_delta = 0.0   # series conversion, see models.series_prob_pick
+
     def __init__(self, tau_days: float = 180.0, refit_days: float = 1.0, C: float = 3.0,
                  region: bool = True, region_C: float | None = None, intercept: bool = False,
                  min_weight: float = 0.02, warm: bool = True, round_weight: float = 0.0,
-                 round_scale: float = 0.25):
+                 round_scale: float = 0.25, sides: bool = False):
         # round_weight > 0 adds a margin likelihood: each round of a valid map is a Bernoulli with
         # logit round_scale * (theta_1 - theta_2), weighted by round_weight because rounds within a
         # map are correlated (economy, momentum) and carry less than one independent observation each.
         self.round_weight, self.round_scale = round_weight, round_scale
+        # sides=True splits the round rows by CT/T half and fits one CT-bias column per map (round-logit units),
+        # so a lopsided half is not read as team strength (Liquipedia only; needs round_weight)
+        self.sides = sides
+        self.sidx: dict[str, int] = {}         # map -> side column (after entities and regions)
+        self.n_side = 0                        # side columns in the last fit
         self.tau, self.refit, self.C, self.region = tau_days * DAY, refit_days * DAY, C, region
         self.region_C = region_C or C   # region columns see thousands of maps, so the ridge barely binds anyway
         self.intercept, self.min_weight, self.warm = intercept, min_weight, warm
         self.idx: dict[str, int] = {}          # entity -> column
         self.ridx: dict[str, int] = {}         # region -> column (after entities)
         self.entity_region: dict[str, str] = {}
-        # (time, cols1, cols2, y, weight multiplier, design scale); round rows use scale round_scale
-        self.obs: list[tuple[float, tuple[int, ...], tuple[int, ...], float, float, float]] = []
+        # (time, cols1, cols2, y, weight multiplier, design scale, (map, side) or None); round rows use
+        # scale round_scale, side is +1/-1 for the half team1 played as CT/T
+        self.obs: list[tuple] = []
         self.last_fit = -math.inf
         self.theta = np.zeros(0)
         self.b = 0.0
@@ -60,6 +68,8 @@ class BatchBT(Model):
         tag = f"tau={tau_days:g}d,refit={refit_days:g}d,C={C:g}" + (",region" if region else "") + (",b" if intercept else "")
         if round_weight:
             tag += f",rounds={round_weight:g}x{round_scale:g}"
+        if sides:
+            tag += ",sides"
         self.name = f"batch-bt[{tag}]"
 
     # ---- bookkeeping -------------------------------------------------------------------------
@@ -90,7 +100,8 @@ class BatchBT(Model):
         if len(keep) < 50 or n_cols == 0 or len({o[3] for o in keep}) < 2:
             return
         rows, cols, vals, y, w = [], [], [], [], []
-        for i, (t, c1, c2, out, wm, sc) in enumerate(keep):
+        srows, scols, svals = [], [], []
+        for i, (t, c1, c2, out, wm, sc, side) in enumerate(keep):
             for c in c1:
                 rows.append(i); cols.append(c); vals.append(sc / len(c1))
             for c in c2:
@@ -100,10 +111,13 @@ class BatchBT(Model):
                 r2 = self._rcol(self.entity_region[self._ent(c2[0])])
                 if r1 != r2:
                     rows += [i, i]; cols += [n_ent + r1, n_ent + r2]; vals += [sc, -sc]
+            if side is not None:
+                srows.append(i); scols.append(self.sidx.setdefault(side[0], len(self.sidx))); svals.append(float(side[1]))
             y.append(out)
             w.append(wm * math.exp(-(now - t) / self.tau))
-        n_cols = n_ent + (len(self.ridx) if self.region else 0)
-        X = sp.csr_matrix((vals, (rows, cols)), shape=(len(keep), n_cols))
+        n_base = n_ent + (len(self.ridx) if self.region else 0)
+        n_cols = n_base + len(self.sidx)
+        X = sp.csr_matrix((vals + svals, (rows + srows, cols + [n_base + c for c in scols])), shape=(len(keep), n_cols))
         y, w = np.array(y), np.array(w)
         # per-column penalty: scale region columns up so their effective C is region_C
         if self.region and len(self.ridx):
@@ -119,6 +133,7 @@ class BatchBT(Model):
             lr.intercept_ = np.array([self.b])
         lr.fit(X, y, sample_weight=w)
         self.theta = lr.coef_[0] * scale
+        self.n_side = len(self.sidx)
         self.b = float(lr.intercept_[0]) if self.intercept else 0.0
         self.last_fit = now
         self.fits += 1
@@ -133,7 +148,7 @@ class BatchBT(Model):
     def logit(self, m: Match) -> float:
         c1 = self._cols(m.team1_players, m.team1_countries)
         c2 = self._cols(m.team2_players, m.team2_countries)
-        n_ent = len(self.theta) - (len(self.ridx) if self.region else 0)
+        n_ent = self.n_ent_fit()
         z = sum(self._theta(c) for c in c1) / len(c1) - sum(self._theta(c) for c in c2) / len(c2)
         if self.region:
             r1, r2 = m.team1_region, m.team2_region
@@ -143,20 +158,34 @@ class BatchBT(Model):
                         z += sign * self.theta[n_ent + self.ridx[reg]]
         return z + self.b
 
+    def n_ent_fit(self) -> int:
+        """Entity columns in the last fit (theta = entities, then regions, then side columns)."""
+        return len(self.theta) - (len(self.ridx) if self.region else 0) - self.n_side
+
+    def side_bias(self, map_name: str) -> float:
+        """Fitted CT-side round logit for a map (0 if unfitted)."""
+        if map_name not in self.sidx or self.sidx[map_name] >= self.n_side:
+            return 0.0
+        return float(self.theta[len(self.theta) - self.n_side + self.sidx[map_name]])
+
     def predict(self, m: Match) -> float:
         if m.time - self.last_fit >= self.refit:
             self.fit(m.time)
         p = 1.0 / (1.0 + math.exp(-self.logit(m)))
-        return series_prob(p, m.best_of)
+        return series_prob_pick(p, m.best_of, self.pick_delta)
 
     def update(self, m: Match) -> None:
         c1 = self._cols(m.team1_players, m.team1_countries)
         c2 = self._cols(m.team2_players, m.team2_countries)
         for mp in m.maps:
-            self.obs.append((m.time, c1, c2, 1.0 if mp.t1_won else 0.0, 1.0, 1.0))
+            self.obs.append((m.time, c1, c2, 1.0 if mp.t1_won else 0.0, 1.0, 1.0, None))
             if self.round_weight and mp.valid_for_margin:
-                self.obs.append((m.time, c1, c2, 1.0, self.round_weight * mp.t1, self.round_scale))
-                self.obs.append((m.time, c1, c2, 0.0, self.round_weight * mp.t2, self.round_scale))
+                for a, b, side in round_blocks(mp, self.sides):
+                    key = (mp.name, side) if side else None
+                    if a:
+                        self.obs.append((m.time, c1, c2, 1.0, self.round_weight * a, self.round_scale, key))
+                    if b:
+                        self.obs.append((m.time, c1, c2, 0.0, self.round_weight * b, self.round_scale, key))
 
     def rating(self, players) -> float:
         """Elo-scale rating (1500 = region-neutral zero) for display."""
@@ -197,7 +226,7 @@ def main():
     for lo, hi, n, mp, obs in calibration(preds, 10):
         print(f"{lo:4.1f}-{hi:4.1f}  {n:5d} {mp:6.3f} {obs:6.3f}")
     if inner.region and inner.ridx:
-        n_ent = len(inner.theta) - len(inner.ridx)
+        n_ent = inner.n_ent_fit()
         print("region effects (Elo points):", {r: round(ELO_PER_LOGIT * inner.theta[n_ent + i]) for r, i in inner.ridx.items()})
 
 
